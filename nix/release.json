@@ -1,13 +1,13 @@
 {
-  "version": "1.4.203",
+  "version": "1.4.204",
   "sources": {
     "x86_64-linux": {
       "file": "orca-linux.AppImage",
-      "hash": "sha256-aJxYOXEEM5dnCTh6bUUotGcdd4RYwytvvOBOpuYI3ok="
+      "hash": "sha256-DISBBX0lC80GKZIUvV4hQ5E3lkso5ozC6hdvmg68NVk="
     },
     "aarch64-linux": {
       "file": "orca-linux-arm64.AppImage",
-      "hash": "sha256-XWpYLKoXoGi8xMCUhAvPuIJCC5/BIQmPND+46gqT1Bw="
+      "hash": "sha256-M378Wvpl1Av9hT98pC8sDJUBqRTofDjOTEfxKlmhbI4="
     }
   }
 }
