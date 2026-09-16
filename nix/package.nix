@@ -2,7 +2,9 @@
   lib,
   stdenvNoCC,
   stdenv,
+  callPackage,
   fetchurl,
+  asar,
   appimageTools,
   autoPatchelfHook,
   patchelf,
@@ -68,6 +70,45 @@ let
     pname = "orca-ide";
     inherit version src;
   };
+  # Source overlay: the release's bundled JavaScript is replaced with a build from the same
+  # upstream tag plus nix/patches. A stale pin (release moved on, overlay not yet rebased) falls
+  # back to the unpatched release so daily updates keep flowing; a patch conflict fails loudly.
+  overlay = builtins.fromJSON (builtins.readFile ./source-overlay.json);
+  overlayApplies =
+    lib.warnIf (overlay.version != version)
+      "orca-nix: source overlay is pinned to ${overlay.version} but the release is ${version}; building the unpatched release"
+      (overlay.version == version);
+  appBundle = callPackage ./app-bundle.nix { inherit version overlay; };
+  # electron-builder's asarUnpack list (config/electron-builder.config.cjs upstream), so the
+  # repacked archive keeps the same unpacked layout the release shipped with.
+  asarUnpackDirs = [
+    "out/cli"
+    "out/shared"
+    "out/main/agent-hooks"
+    "out/main/antigravity"
+    "out/main/claude"
+    "out/main/codex"
+    "out/main/copilot"
+    "out/main/cursor"
+    "out/main/droid"
+    "out/main/gemini"
+    "out/main/grok"
+    "out/main/hermes"
+    "out/main/chunks"
+    "resources"
+  ];
+  # asar matches --unpack against absolute paths, hence the leading **/.
+  asarUnpackFiles = map (file: "**/${file}") [
+    "out/package.json"
+    "out/main/claude-accounts/keychain.js"
+    "out/main/daemon-entry.js"
+    "out/main/session-scanner-service-entry.js"
+    "out/main/wsl-transcript-fs-process-entry.js"
+    "out/main/session-scanner-opencode-sqlite-worker-entry.js"
+    "out/main/plugin-host-entry.js"
+    "out/main/computer-sidecar.js"
+    "out/main/parcel-watcher-process-entry.js"
+  ];
   runtimeTools = lib.makeBinPath [
     coreutils
     git
@@ -89,7 +130,8 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     makeWrapper
     wrapGAppsHook3
     gobject-introspection
-  ];
+  ]
+  ++ lib.optional overlayApplies asar;
   buildInputs = [
     alsa-lib
     at-spi2-atk
@@ -156,6 +198,27 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     substituteInPlace "$out/share/applications/orca-ide.desktop" \
       --replace-fail 'Exec=AppRun' "Exec=$out/bin/orca-ide-desktop"
     cp -a ${contents}/usr/share/icons "$out/share/"
+    ${lib.optionalString overlayApplies ''
+      resources="$out/lib/orca-ide/resources"
+      asar extract "$resources/app.asar" "$TMPDIR/app"
+      for dir in main preload renderer shared cli web; do
+        rm -rf "$TMPDIR/app/out/$dir"
+        cp -r "${appBundle}/$dir" "$TMPDIR/app/out/$dir"
+      done
+      mv "$resources/app.asar.unpacked" "$TMPDIR/release-unpacked"
+      rm "$resources/app.asar"
+      asar pack "$TMPDIR/app" "$resources/app.asar" \
+        --unpack-dir '{${lib.concatStringsSep "," asarUnpackDirs}}' \
+        --unpack '{${lib.concatStringsSep "," asarUnpackFiles}}'
+      # The unpacked layout must match the release's: identical outside out/, and identical
+      # inside out/ apart from content-hashed chunk names.
+      echo "checking unpacked layout outside out/"
+      diff <(cd "$TMPDIR/release-unpacked" && find . -path ./out -prune -o -type f -print | sort) \
+        <(cd "$resources/app.asar.unpacked" && find . -path ./out -prune -o -type f -print | sort)
+      echo "checking unpacked layout inside out/"
+      diff <(cd "$TMPDIR/release-unpacked" && find out -type f -not -path 'out/main/chunks/*' | sort) \
+        <(cd "$resources/app.asar.unpacked" && find out -type f -not -path 'out/main/chunks/*' | sort)
+    ''}
 
     runHook postInstall
   '';
@@ -185,6 +248,9 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     done
   '';
 
+  passthru = {
+    inherit appBundle overlayApplies;
+  };
   passthru.tests.smoke =
     runCommand "orca-ide-smoke"
       {
@@ -227,7 +293,10 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     description = "IDE for orchestrating AI coding agents across terminals and worktrees";
     homepage = "https://github.com/stablyai/orca";
     license = lib.licenses.mit;
-    sourceProvenance = [ lib.sourceTypes.binaryNativeCode ];
+    sourceProvenance = [
+      lib.sourceTypes.binaryNativeCode
+    ]
+    ++ lib.optional overlayApplies lib.sourceTypes.fromSource;
     platforms = builtins.attrNames sources;
     mainProgram = "orca-ide-desktop";
   };

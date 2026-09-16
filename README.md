@@ -63,6 +63,27 @@ For Home Manager, use `home.packages` instead. A non-flake configuration can use
 `pkgs.callPackage /absolute/path/to/orca-nix/nix/package.nix { }` with a compatible
 Nixpkgs (the flake's locked revision is the tested version).
 
+## Patched source overlay
+
+The default package is not a pure release: its bundled JavaScript is rebuilt from the
+upstream tag pinned in `nix/release.json` with the patches listed in
+[`nix/source-overlay.json`](nix/source-overlay.json) applied (currently the
+[Linux bubblewrap agent sandbox](nix/patches/linux-agent-bubblewrap-sandbox.patch),
+proposed upstream from [elsirion/orca](https://github.com/elsirion/orca)). Only
+`out/` inside `app.asar` is replaced; Electron and every native module still come
+from the release AppImage, so the ABI contract above is unchanged.
+
+The overlay pins two hashes that change with every release. CI refreshes them with
+`scripts/update_source_overlay.py` right after the release manifest, so the daily
+update keeps working as long as the patches still apply. A patch conflict fails that
+update and leaves the published pin unchanged until the patch is rebased. If the
+overlay pin ever lags the release, the package evaluates with a warning and builds
+the unpatched release instead, so `nix build` never silently mixes versions.
+
+To rebase after a release moved on, regenerate the patch from a fork branch rebased
+onto the new tag, drop it into `nix/patches/`, then run
+`python3 scripts/update_source_overlay.py` (it needs Nix and network access).
+
 ## Updates and verification
 
 The Nix store is immutable: upgrade through Nix, not Orca's in-app updater.

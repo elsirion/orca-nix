@@ -21,7 +21,7 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 90
     outputs:
       changed: ${{ steps.update.outputs.changed }}
     steps:
@@ -37,7 +37,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 scripts/update_release.py
-          if git diff --quiet -- nix/release.json; then
+          # Re-pins the patched source build to the new release; a patch conflict fails here.
+          python3 scripts/update_source_overlay.py
+          if git diff --quiet -- nix/release.json nix/source-overlay.json; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
           else
             echo 'changed=true' >> "$GITHUB_OUTPUT"
@@ -45,7 +47,9 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-manifest
-          path: nix/release.json
+          path: |
+            nix/release.json
+            nix/source-overlay.json
           if-no-files-found: error
           retention-days: 7
 
@@ -56,7 +60,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -92,7 +96,7 @@ jobs:
           version=$(python3 -c 'import json; print(json.load(open("nix/release.json"))["version"])')
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add nix/release.json
+          git add nix/release.json nix/source-overlay.json
           git commit -m "chore(orca): update to $version"
           # Reject a concurrent main change rather than publish an untested combination.
           git push origin HEAD:main

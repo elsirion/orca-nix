@@ -1,0 +1,1843 @@
+From b347a57db02c7c1b566dbfa0fd9516b7b61e05b9 Mon Sep 17 00:00:00 2001
+From: elsirion <elsirion@protonmail.com>
+Date: Tue, 15 Sep 2026 20:33:10 +0200
+Subject: [PATCH] feat(agents): opt-in bubblewrap sandbox for local Linux agent
+ launches
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a Linux-only "Sandbox local agents (bubblewrap)" switch under
+Settings → Agents. When on, every locally launched TUI agent is wrapped
+as `bwrap … -- /bin/sh -c '<command>'` at the PTY spawn seam, so the
+host shell stays interactive while the agent and everything it spawns
+run with a RAM-backed private home and /tmp, a read-only system, the
+workspace (plus its git backend for worktrees) read-write, and the host
+network shared.
+
+Mounts and env follow workspacer's ~/.config/workspacer layout (env,
+home_ro/, home_rw/, home_cow/) so existing configs work unchanged. Orca
+adds what its own integration needs: ~/.orca/agent-hooks and the active
+agent config dir (CLAUDE_CONFIG_DIR / ~/.claude, CODEX_HOME / ~/.codex),
+applied before user mounts so they can be overridden.
+
+Missing bwrap or unusable user namespaces fail the launch with an
+explicit error instead of running unsandboxed. Sandboxed launches count
+as TUI customization so they never route to structured native chat.
+SSH, WSL and ephemeral-VM hosts are unaffected.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ docs/site/content/docs/agents/supported.mdx   |   5 +-
+ docs/site/content/docs/settings.mdx           |   1 +
+ .../agent-sandbox-launch.test.ts              | 243 ++++++++++++++++++
+ .../agent-sandbox/agent-sandbox-launch.ts     | 203 +++++++++++++++
+ .../agent-sandbox/bubblewrap-args.test.ts     | 135 ++++++++++
+ src/main/agent-sandbox/bubblewrap-args.ts     |  95 +++++++
+ .../bubblewrap-preflight.test.ts              |  74 ++++++
+ .../agent-sandbox/bubblewrap-preflight.ts     |  73 ++++++
+ .../bubblewrap.integration.test.ts            |  80 ++++++
+ .../agent-sandbox/workspacer-config.test.ts   | 135 ++++++++++
+ src/main/agent-sandbox/workspacer-config.ts   | 125 +++++++++
+ .../pty/runtime/spawn-agent-sandbox.test.ts   | 100 +++++++
+ .../ipc/pty/runtime/spawn-agent-sandbox.ts    |  78 ++++++
+ src/main/ipc/pty/runtime/spawn.ts             |   5 +
+ src/main/runtime/runtime-client-settings.ts   |   3 +
+ src/main/runtime/runtime-store-contract.ts    |   1 +
+ .../src/components/settings/AgentsPane.tsx    |  21 ++
+ .../components/settings/agent-sandbox-copy.ts |  51 ++++
+ .../src/components/settings/agents-search.ts  |  15 ++
+ .../src/i18n/en-runtime-required.json         |  10 +
+ src/renderer/src/i18n/locales/en.json         |  10 +
+ src/shared/default-global-settings.ts         |   1 +
+ src/shared/global-settings-types.ts           |   2 +
+ .../rpc-contract/client-settings-params.ts    |   1 +
+ .../tui-agent-launch-customization.test.ts    |  23 ++
+ src/shared/tui-agent-launch-customization.ts  |   9 +-
+ 26 files changed, 1497 insertions(+), 2 deletions(-)
+ create mode 100644 src/main/agent-sandbox/agent-sandbox-launch.test.ts
+ create mode 100644 src/main/agent-sandbox/agent-sandbox-launch.ts
+ create mode 100644 src/main/agent-sandbox/bubblewrap-args.test.ts
+ create mode 100644 src/main/agent-sandbox/bubblewrap-args.ts
+ create mode 100644 src/main/agent-sandbox/bubblewrap-preflight.test.ts
+ create mode 100644 src/main/agent-sandbox/bubblewrap-preflight.ts
+ create mode 100644 src/main/agent-sandbox/bubblewrap.integration.test.ts
+ create mode 100644 src/main/agent-sandbox/workspacer-config.test.ts
+ create mode 100644 src/main/agent-sandbox/workspacer-config.ts
+ create mode 100644 src/main/ipc/pty/runtime/spawn-agent-sandbox.test.ts
+ create mode 100644 src/main/ipc/pty/runtime/spawn-agent-sandbox.ts
+ create mode 100644 src/renderer/src/components/settings/agent-sandbox-copy.ts
+ create mode 100644 src/shared/tui-agent-launch-customization.test.ts
+
+diff --git a/docs/site/content/docs/agents/supported.mdx b/docs/site/content/docs/agents/supported.mdx
+index 1d2f496457..0bdf4f5d4c 100644
+--- a/docs/site/content/docs/agents/supported.mdx
++++ b/docs/site/content/docs/agents/supported.mdx
+@@ -11,7 +11,10 @@ Orca works with **any CLI agent** — the agent combobox just launches a process
+   The defaults below pass each agent's permission-bypass flag for new launches. A worktree is an
+   isolated checkout, not a security sandbox: the agent can still access files and network resources
+   available to its process. Choose **Manual** in **Settings → Agents → Agent Permissions** unless
+-  you intentionally trust the agent and the task.
++  you intentionally trust the agent and the task. On Linux, **Sandbox local agents (bubblewrap)** in
++  **Settings → Agents** wraps local launches in a
++  [bubblewrap](https://github.com/containers/bubblewrap) sandbox with a private home and `/tmp`; see
++  [Settings](/docs/settings#agents).
+ </Callout>
+ 
+ ## Permissions default
+diff --git a/docs/site/content/docs/settings.mdx b/docs/site/content/docs/settings.mdx
+index a5bbe9b83f..9683e30ee1 100644
+--- a/docs/site/content/docs/settings.mdx
++++ b/docs/site/content/docs/settings.mdx
+@@ -61,6 +61,7 @@ Settings are grouped into panes. Everything here is searchable with `Cmd-,` then
+ - Claude and Codex account lists.
+ - Startup hooks per agent.
+ - **Agent status hooks** — show working / waiting / done states in Orca. Toggle takes effect without restarting the app (including the Windows WSL hook relay). CLI: `orca agent hooks on|off|status`.
++- **Sandbox local agents (bubblewrap)** — Linux only. Wraps every locally launched agent in a [bubblewrap](https://github.com/containers/bubblewrap) sandbox: RAM-backed private home and `/tmp`, read-only system, the workspace (and its git backend) read-write, host network shared. Home mounts and extra env come from `~/.config/workspacer` (`env`, `home_ro/`, `home_rw/`, `home_cow/`, same layout as [workspacer](https://github.com/elsirion/workspacer)); Orca additionally binds its hook script directory and the active agent config dir. Requires `bwrap` and unprivileged user namespaces; a launch fails with an explicit error instead of running unsandboxed when either is missing. Sandboxed launches always open in the terminal, not the Chat UI. SSH, WSL, and Cloud VM targets are unaffected.
+ - **Keep computer awake** — **On** (stay awake continuously), **Agent** (stay awake while an agent is working), or **Off**. The same control lives on the desktop status bar as **Caffeinate** (coffee icon). Hidden on paired web clients.
+ - **Skill freshness** — the Agents pane and skill cards still show full status. Sidebar navigation only badges skills that need action (**Update available**, **Needs attention** / review); healthy, loading, and optional not-installed rows stay quiet. Use **Update** in the dialog to refresh global skills in the background (no terminal). Progress appears on the status bar; closing the dialog does not cancel the run. See [Orca skills](/docs/cli/skills#keep-skills-up-to-date).
+ 
+diff --git a/src/main/agent-sandbox/agent-sandbox-launch.test.ts b/src/main/agent-sandbox/agent-sandbox-launch.test.ts
+new file mode 100644
+index 0000000000..e57f9d7716
+--- /dev/null
++++ b/src/main/agent-sandbox/agent-sandbox-launch.test.ts
+@@ -0,0 +1,243 @@
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import { quoteStartupArg } from '../../shared/tui-agent-startup-shell'
++import {
++  prepareAgentSandboxStartupCommand,
++  resolveOrcaSandboxMounts,
++  resolveSandboxGitCommonDir,
++  stageCowMounts,
++  wrapStartupCommandInBubblewrap
++} from './agent-sandbox-launch'
++
++const HOME = '/home/u'
++const q = (value: string): string => quoteStartupArg(value, 'posix')
++const argvLine = (...argv: string[]): string => argv.map(q).join(' ')
++
++describe('resolveOrcaSandboxMounts', () => {
++  it('binds the hook dir and the effective Claude config dir for claude', () => {
++    const mounts = resolveOrcaSandboxMounts({
++      agent: 'claude',
++      homeDir: HOME,
++      env: { CLAUDE_CONFIG_DIR: '/data/claude-home' },
++      exists: () => true
++    })
++    expect(mounts).toEqual([
++      { mode: 'ro', source: '/home/u/.orca/agent-hooks', target: '/home/u/.orca/agent-hooks' },
++      { mode: 'rw', source: '/data/claude-home', target: '/data/claude-home' },
++      { mode: 'rw', source: '/home/u/.claude.json', target: '/home/u/.claude.json' }
++    ])
++  })
++
++  it('falls back to ~/.claude and drops missing paths', () => {
++    const mounts = resolveOrcaSandboxMounts({
++      agent: 'claude-agent-teams',
++      homeDir: HOME,
++      env: {},
++      exists: (path) => path === '/home/u/.claude'
++    })
++    expect(mounts).toEqual([
++      { mode: 'rw', source: '/home/u/.claude', target: '/home/u/.claude' }
++    ])
++  })
++
++  it('binds CODEX_HOME for codex and nothing agent-specific for others', () => {
++    expect(
++      resolveOrcaSandboxMounts({ agent: 'codex', homeDir: HOME, env: { CODEX_HOME: '/c' }, exists: () => true })
++    ).toEqual([
++      { mode: 'ro', source: '/home/u/.orca/agent-hooks', target: '/home/u/.orca/agent-hooks' },
++      { mode: 'rw', source: '/c', target: '/c' }
++    ])
++    expect(
++      resolveOrcaSandboxMounts({ agent: 'gemini', homeDir: HOME, env: {}, exists: () => true })
++    ).toEqual([
++      { mode: 'ro', source: '/home/u/.orca/agent-hooks', target: '/home/u/.orca/agent-hooks' }
++    ])
++  })
++})
++
++describe('resolveSandboxGitCommonDir', () => {
++  it('returns null when .git is not a file (main repo or folder workspace)', () => {
++    expect(resolveSandboxGitCommonDir('/w', { isFile: () => false })).toBeNull()
++  })
++
++  it('resolves the common dir relative to the worktree', () => {
++    expect(
++      resolveSandboxGitCommonDir('/w/feature', {
++        isFile: () => true,
++        isDirectory: (path) => path === '/w/.git',
++        gitCommonDir: () => '../.git\n'
++      })
++    ).toBe('/w/.git')
++  })
++
++  it('throws when git fails or the common dir is missing', () => {
++    expect(() =>
++      resolveSandboxGitCommonDir('/w/feature', {
++        isFile: () => true,
++        gitCommonDir: () => {
++          throw new Error('boom')
++        }
++      })
++    ).toThrow("'/w/feature' is a git worktree but its backing repository is unavailable")
++    expect(() =>
++      resolveSandboxGitCommonDir('/w/feature', {
++        isFile: () => true,
++        isDirectory: () => false,
++        gitCommonDir: () => '/gone/.git'
++      })
++    ).toThrow('backing repository is unavailable')
++  })
++})
++
++describe('stageCowMounts', () => {
++  let root: string
++
++  beforeEach(() => {
++    root = mkdtempSync(join(tmpdir(), 'orca-sandbox-cow-'))
++  })
++
++  afterEach(() => {
++    rmSync(root, { recursive: true, force: true })
++  })
++
++  it('passes ro/rw through and copies cow entries into a staging dir', () => {
++    const cowSource = join(root, 'home_cow', '.config', 'tool')
++    mkdirSync(cowSource, { recursive: true })
++    writeFileSync(join(cowSource, 'settings.json'), '{"a":1}')
++    const { mounts, stagingDir } = stageCowMounts(
++      [
++        { mode: 'ro', source: '/cfg/home_ro/.bashrc', homeRelativePath: '.bashrc' },
++        { mode: 'cow', source: cowSource, homeRelativePath: join('.config', 'tool') }
++      ],
++      join(root, 'staging'),
++      HOME
++    )
++    expect(stagingDir).not.toBeNull()
++    expect(mounts).toEqual([
++      { mode: 'ro', source: '/cfg/home_ro/.bashrc', target: '/home/u/.bashrc' },
++      { mode: 'rw', source: join(stagingDir!, '.config', 'tool'), target: '/home/u/.config/tool' }
++    ])
++    expect(readFileSync(join(stagingDir!, '.config', 'tool', 'settings.json'), 'utf8')).toBe('{"a":1}')
++  })
++
++  it('creates no staging dir without cow entries', () => {
++    const result = stageCowMounts(
++      [{ mode: 'rw', source: '/cfg/home_rw/.claude', homeRelativePath: '.claude' }],
++      join(root, 'staging'),
++      HOME
++    )
++    expect(result.stagingDir).toBeNull()
++    expect(existsSync(join(root, 'staging'))).toBe(false)
++  })
++})
++
++describe('wrapStartupCommandInBubblewrap', () => {
++  it('runs the original command through /bin/sh -c inside bwrap', () => {
++    const command = "claude --dangerously-skip-permissions --prefill 'fix it'"
++    expect(
++      wrapStartupCommandInBubblewrap({
++        bwrapPath: '/usr/bin/bwrap',
++        bwrapArgs: ['--unshare-all', '--setenv', 'FOO', 'bar baz'],
++        command,
++        stagingDir: null
++      })
++    ).toBe(
++      argvLine('/usr/bin/bwrap', '--unshare-all', '--setenv', 'FOO', 'bar baz', '--', '/bin/sh', '-c', command)
++    )
++  })
++
++  it('removes the staging dir on the host after bwrap returns', () => {
++    expect(
++      wrapStartupCommandInBubblewrap({
++        bwrapPath: 'bwrap',
++        bwrapArgs: [],
++        command: 'claude',
++        stagingDir: '/tmp/orca-agent-sandbox/cow-abc'
++      })
++    ).toBe(
++      `${argvLine('bwrap', '--', '/bin/sh', '-c', 'claude')}; rm -rf ${q('/tmp/orca-agent-sandbox/cow-abc')}`
++    )
++  })
++})
++
++describe('prepareAgentSandboxStartupCommand', () => {
++  it('assembles preflight, config, mounts and wrapping', async () => {
++    const command = await prepareAgentSandboxStartupCommand({
++      agent: 'claude',
++      command: 'claude --dangerously-skip-permissions',
++      workdir: '/home/u/ws/repo/feature',
++      env: {},
++      homeDir: HOME,
++      processEnv: { WORKSPACER_CONFIG_DIR: '/cfg', WORKSPACER_HOME_SIZE_MB: '1' },
++      stagingParent: '/unused',
++      deps: {
++        resolveBwrap: async () => '/nix/bin/bwrap',
++        readConfig: (configDir) => ({
++          configDir,
++          env: [{ key: 'FOO', value: 'bar' }],
++          homeMounts: [{ mode: 'rw', source: '/cfg/home_rw/.gitconfig', homeRelativePath: '.gitconfig' }]
++        }),
++        exists: (path) => path === '/nix' || path === '/home/u/.claude',
++        gitCommonDir: () => '/home/u/ws/repo/.git'
++      }
++    })
++    expect(command).toBe(
++      argvLine(
++        '/nix/bin/bwrap',
++        '--unshare-all',
++        '--share-net',
++        '--die-with-parent',
++        '--dev',
++        '/dev',
++        '--proc',
++        '/proc',
++        '--ro-bind',
++        '/sys',
++        '/sys',
++        '--ro-bind',
++        '/nix',
++        '/nix',
++        '--size',
++        String(8192 * 1024 * 1024),
++        '--tmpfs',
++        '/tmp',
++        '--size',
++        String(1024 * 1024),
++        '--tmpfs',
++        '/home/u',
++        '--bind',
++        '/home/u/ws/repo/feature',
++        '/home/u/ws/repo/feature',
++        '--bind',
++        '/home/u/ws/repo/.git',
++        '/home/u/ws/repo/.git',
++        '--chdir',
++        '/home/u/ws/repo/feature',
++        '--setenv',
++        'HOME',
++        '/home/u',
++        '--setenv',
++        'WORKSPACER_SANDBOX',
++        '1',
++        '--setenv',
++        'ORCA_AGENT_SANDBOX',
++        'bwrap',
++        '--bind',
++        '/home/u/.claude',
++        '/home/u/.claude',
++        '--bind',
++        '/cfg/home_rw/.gitconfig',
++        '/home/u/.gitconfig',
++        '--setenv',
++        'FOO',
++        'bar',
++        '--',
++        '/bin/sh',
++        '-c',
++        'claude --dangerously-skip-permissions'
++      )
++    )
++  })
++})
+diff --git a/src/main/agent-sandbox/agent-sandbox-launch.ts b/src/main/agent-sandbox/agent-sandbox-launch.ts
+new file mode 100644
+index 0000000000..7a5e44051f
+--- /dev/null
++++ b/src/main/agent-sandbox/agent-sandbox-launch.ts
+@@ -0,0 +1,203 @@
++import { cpSync, existsSync, mkdirSync, mkdtempSync, statSync } from 'node:fs'
++import { dirname, join, resolve } from 'node:path'
++import { quoteStartupArg } from '../../shared/tui-agent-startup-shell'
++import type { TuiAgent } from '../../shared/tui-agent'
++import { gitExecFileSync } from '../git/runner'
++import {
++  BUBBLEWRAP_SYSTEM_MOUNT_CANDIDATES,
++  buildBubblewrapArgs,
++  DEFAULT_SANDBOX_HOME_SIZE_MB,
++  DEFAULT_SANDBOX_TMP_SIZE_MB,
++  resolveSandboxSizeMb,
++  type SandboxBindMount
++} from './bubblewrap-args'
++import { resolveBubblewrapExecutable } from './bubblewrap-preflight'
++import {
++  readWorkspacerSandboxConfig,
++  resolveWorkspacerConfigDir,
++  type WorkspacerHomeMount,
++  type WorkspacerSandboxConfig
++} from './workspacer-config'
++
++/** Shell that evaluates the original startup command inside the sandbox; `/bin` is bound from the host. */
++const SANDBOX_COMMAND_SHELL = '/bin/sh'
++
++type PathExists = (path: string) => boolean
++
++/**
++ * Mounts Orca's own integration needs: the hook script resolves through `${HOME}`, and status
++ * hooks plus transcript reading live in the agent's config dir. Applied before user mounts so a
++ * workspacer entry can still override them.
++ */
++export function resolveOrcaSandboxMounts(input: {
++  agent: TuiAgent
++  homeDir: string
++  env: Readonly<Record<string, string | undefined>>
++  exists?: PathExists
++}): SandboxBindMount[] {
++  const exists = input.exists ?? existsSync
++  const candidates: SandboxBindMount[] = [
++    bind('ro', join(input.homeDir, '.orca', 'agent-hooks'))
++  ]
++  if (input.agent === 'claude' || input.agent === 'claude-agent-teams') {
++    candidates.push(
++      bind('rw', input.env.CLAUDE_CONFIG_DIR?.trim() || join(input.homeDir, '.claude')),
++      bind('rw', join(input.homeDir, '.claude.json'))
++    )
++  } else if (input.agent === 'codex') {
++    candidates.push(bind('rw', input.env.CODEX_HOME?.trim() || join(input.homeDir, '.codex')))
++  }
++  return candidates.filter((mount) => exists(mount.source))
++}
++
++function bind(mode: SandboxBindMount['mode'], path: string): SandboxBindMount {
++  return { mode, source: path, target: path }
++}
++
++/**
++ * A worktree's `.git` is a file pointing into the main repo, which must be bound too. Fails
++ * loudly when the backing repo is unavailable rather than dropping the agent into a checkout
++ * where every git command dies with "not a git repository".
++ */
++export function resolveSandboxGitCommonDir(
++  workdir: string,
++  deps: {
++    isFile?: (path: string) => boolean
++    isDirectory?: (path: string) => boolean
++    gitCommonDir?: (workdir: string) => string
++  } = {}
++): string | null {
++  const isFile = deps.isFile ?? ((path: string) => safeStat(path)?.isFile() === true)
++  const isDirectory =
++    deps.isDirectory ?? ((path: string) => safeStat(path)?.isDirectory() === true)
++  if (!isFile(join(workdir, '.git'))) {
++    return null
++  }
++  const unavailable = new Error(
++    `'${workdir}' is a git worktree but its backing repository is unavailable; refusing to launch the sandboxed agent.`
++  )
++  let commonDir: string
++  try {
++    commonDir = (deps.gitCommonDir ?? runGitCommonDir)(workdir).trim()
++  } catch {
++    throw unavailable
++  }
++  const absolute = resolve(workdir, commonDir)
++  if (!commonDir || !isDirectory(absolute)) {
++    throw unavailable
++  }
++  return absolute
++}
++
++function runGitCommonDir(workdir: string): string {
++  return gitExecFileSync(['rev-parse', '--git-common-dir'], { cwd: workdir })
++}
++
++function safeStat(path: string): ReturnType<typeof statSync> | null {
++  try {
++    return statSync(path)
++  } catch {
++    return null
++  }
++}
++
++/** Copies `home_cow` entries into a per-launch staging dir so writes never reach the originals. */
++export function stageCowMounts(
++  mounts: readonly WorkspacerHomeMount[],
++  stagingParent: string,
++  homeDir: string
++): { mounts: SandboxBindMount[]; stagingDir: string | null } {
++  let stagingDir: string | null = null
++  const staged = mounts.map((mount): SandboxBindMount => {
++    const target = join(homeDir, mount.homeRelativePath)
++    if (mount.mode !== 'cow') {
++      return { mode: mount.mode, source: mount.source, target }
++    }
++    if (!stagingDir) {
++      mkdirSync(stagingParent, { recursive: true })
++      stagingDir = mkdtempSync(join(stagingParent, 'cow-'))
++    }
++    const stagedPath = join(stagingDir, mount.homeRelativePath)
++    mkdirSync(dirname(stagedPath), { recursive: true })
++    cpSync(mount.source, stagedPath, { recursive: true, dereference: true, preserveTimestamps: true })
++    return { mode: 'rw', source: stagedPath, target }
++  })
++  return { mounts: staged, stagingDir }
++}
++
++/**
++ * The host's interactive shell evaluates this string, so the sandboxed `/bin/sh -c` re-parses
++ * the original command with the same POSIX quoting it was built for. Staging cleanup rides on
++ * the same line: it runs on the host once bwrap returns.
++ */
++export function wrapStartupCommandInBubblewrap(input: {
++  bwrapPath: string
++  bwrapArgs: readonly string[]
++  command: string
++  stagingDir: string | null
++}): string {
++  const quote = (value: string): string => quoteStartupArg(value, 'posix')
++  const argv = [input.bwrapPath, ...input.bwrapArgs, '--', SANDBOX_COMMAND_SHELL, '-c', input.command]
++  const wrapped = argv.map(quote).join(' ')
++  return input.stagingDir ? `${wrapped}; rm -rf ${quote(input.stagingDir)}` : wrapped
++}
++
++export type AgentSandboxLaunchDeps = {
++  resolveBwrap?: () => Promise<string>
++  readConfig?: (configDir: string) => WorkspacerSandboxConfig
++  exists?: PathExists
++  gitCommonDir?: (workdir: string) => string | null
++}
++
++export async function prepareAgentSandboxStartupCommand(input: {
++  agent: TuiAgent
++  command: string
++  workdir: string
++  /** The PTY's environment, where a managed account pins `CLAUDE_CONFIG_DIR` / `CODEX_HOME`. */
++  env: Readonly<Record<string, string | undefined>>
++  homeDir: string
++  processEnv: NodeJS.ProcessEnv
++  stagingParent: string
++  deps?: AgentSandboxLaunchDeps
++}): Promise<string> {
++  const deps = input.deps ?? {}
++  const exists = deps.exists ?? existsSync
++  const bwrapPath = await (deps.resolveBwrap ?? resolveBubblewrapExecutable)()
++  const config = (deps.readConfig ?? readWorkspacerSandboxConfig)(
++    resolveWorkspacerConfigDir(input.processEnv, input.homeDir)
++  )
++  const gitCommonDir = (deps.gitCommonDir ?? resolveSandboxGitCommonDir)(input.workdir)
++  const { mounts, stagingDir } = stageCowMounts(
++    config.homeMounts,
++    input.stagingParent,
++    input.homeDir
++  )
++  const bwrapArgs = buildBubblewrapArgs({
++    homeDir: input.homeDir,
++    workdir: input.workdir,
++    gitCommonDir,
++    systemMounts: BUBBLEWRAP_SYSTEM_MOUNT_CANDIDATES.filter(exists),
++    tmpSizeMb: resolveSandboxSizeMb(
++      input.processEnv.WORKSPACER_TMP_SIZE_MB,
++      DEFAULT_SANDBOX_TMP_SIZE_MB
++    ),
++    homeSizeMb: resolveSandboxSizeMb(
++      input.processEnv.WORKSPACER_HOME_SIZE_MB,
++      DEFAULT_SANDBOX_HOME_SIZE_MB
++    ),
++    orcaMounts: resolveOrcaSandboxMounts({
++      agent: input.agent,
++      homeDir: input.homeDir,
++      env: input.env,
++      exists
++    }),
++    userHomeMounts: mounts,
++    userEnv: config.env
++  })
++  return wrapStartupCommandInBubblewrap({
++    bwrapPath,
++    bwrapArgs,
++    command: input.command,
++    stagingDir
++  })
++}
+diff --git a/src/main/agent-sandbox/bubblewrap-args.test.ts b/src/main/agent-sandbox/bubblewrap-args.test.ts
+new file mode 100644
+index 0000000000..101711207a
+--- /dev/null
++++ b/src/main/agent-sandbox/bubblewrap-args.test.ts
+@@ -0,0 +1,135 @@
++import { describe, expect, it } from 'vitest'
++import {
++  buildBubblewrapArgs,
++  DEFAULT_SANDBOX_HOME_SIZE_MB,
++  resolveSandboxSizeMb,
++  type BubblewrapArgsInput
++} from './bubblewrap-args'
++
++const HOME = '/home/u'
++
++function baseInput(overrides: Partial<BubblewrapArgsInput> = {}): BubblewrapArgsInput {
++  return {
++    homeDir: HOME,
++    workdir: '/home/u/ws/repo/feature',
++    gitCommonDir: null,
++    systemMounts: ['/nix', '/etc'],
++    tmpSizeMb: 1,
++    homeSizeMb: 2,
++    orcaMounts: [],
++    userHomeMounts: [],
++    userEnv: [],
++    ...overrides
++  }
++}
++
++describe('buildBubblewrapArgs', () => {
++  it('emits namespaces, system mounts, capped tmpfs, workdir and marker env in order', () => {
++    expect(buildBubblewrapArgs(baseInput())).toEqual([
++      '--unshare-all',
++      '--share-net',
++      '--die-with-parent',
++      '--dev',
++      '/dev',
++      '--proc',
++      '/proc',
++      '--ro-bind',
++      '/sys',
++      '/sys',
++      '--ro-bind',
++      '/nix',
++      '/nix',
++      '--ro-bind',
++      '/etc',
++      '/etc',
++      '--size',
++      String(1024 * 1024),
++      '--tmpfs',
++      '/tmp',
++      '--size',
++      String(2 * 1024 * 1024),
++      '--tmpfs',
++      HOME,
++      '--bind',
++      '/home/u/ws/repo/feature',
++      '/home/u/ws/repo/feature',
++      '--chdir',
++      '/home/u/ws/repo/feature',
++      '--setenv',
++      'HOME',
++      HOME,
++      '--setenv',
++      'WORKSPACER_SANDBOX',
++      '1',
++      '--setenv',
++      'ORCA_AGENT_SANDBOX',
++      'bwrap'
++    ])
++  })
++
++  it('binds the git common dir right after the workdir', () => {
++    const args = buildBubblewrapArgs(
++      baseInput({ gitCommonDir: '/home/u/ws/repo/.git' })
++    ).join(' ')
++    expect(args).toContain(
++      '--bind /home/u/ws/repo/feature /home/u/ws/repo/feature --bind /home/u/ws/repo/.git /home/u/ws/repo/.git --chdir'
++    )
++  })
++
++  it('places orca mounts before user mounts and creates deduplicated parent dirs under home', () => {
++    const args = buildBubblewrapArgs(
++      baseInput({
++        orcaMounts: [{ mode: 'ro', source: '/home/u/.orca/agent-hooks', target: '/home/u/.orca/agent-hooks' }],
++        userHomeMounts: [
++          { mode: 'ro', source: '/cfg/home_ro/.local/bin', target: '/home/u/.local/bin' },
++          { mode: 'rw', source: '/cfg/home_rw/.local/share/x', target: '/home/u/.local/share/x' },
++          { mode: 'rw', source: '/elsewhere/.claude', target: '/data/claude-home' }
++        ]
++      })
++    )
++    const tail = args.slice(args.indexOf('ORCA_AGENT_SANDBOX') + 2)
++    expect(tail).toEqual([
++      '--dir',
++      '/home/u/.orca',
++      '--ro-bind',
++      '/home/u/.orca/agent-hooks',
++      '/home/u/.orca/agent-hooks',
++      '--dir',
++      '/home/u/.local',
++      '--ro-bind',
++      '/cfg/home_ro/.local/bin',
++      '/home/u/.local/bin',
++      '--dir',
++      '/home/u/.local/share',
++      '--bind',
++      '/cfg/home_rw/.local/share/x',
++      '/home/u/.local/share/x',
++      '--bind',
++      '/elsewhere/.claude',
++      '/data/claude-home'
++    ])
++  })
++
++  it('appends user env after mounts', () => {
++    const args = buildBubblewrapArgs(
++      baseInput({ userEnv: [{ key: 'FOO', value: 'bar baz' }] })
++    )
++    expect(args.slice(-3)).toEqual(['--setenv', 'FOO', 'bar baz'])
++  })
++})
++
++describe('resolveSandboxSizeMb', () => {
++  it('uses the fallback for missing, non-numeric or non-positive values', () => {
++    expect(resolveSandboxSizeMb(undefined, DEFAULT_SANDBOX_HOME_SIZE_MB)).toBe(
++      DEFAULT_SANDBOX_HOME_SIZE_MB
++    )
++    expect(resolveSandboxSizeMb('abc', 5)).toBe(5)
++    expect(resolveSandboxSizeMb('0', 5)).toBe(5)
++    expect(resolveSandboxSizeMb('-3', 5)).toBe(5)
++  })
++
++  it('accepts positive integers', () => {
++    expect(resolveSandboxSizeMb('4096', 5)).toBe(4096)
++    expect(resolveSandboxSizeMb(' 12 ', 5)).toBe(12)
++  })
++})
+diff --git a/src/main/agent-sandbox/bubblewrap-args.ts b/src/main/agent-sandbox/bubblewrap-args.ts
+new file mode 100644
+index 0000000000..cc3819a13b
+--- /dev/null
++++ b/src/main/agent-sandbox/bubblewrap-args.ts
+@@ -0,0 +1,95 @@
++import { dirname } from 'node:path'
++import type { WorkspacerEnvEntry } from './workspacer-config'
++
++/**
++ * Pure bubblewrap argv builder; a port of workspacer's `_ws_run_sandboxed`. Everything that
++ * touches the filesystem (existence checks, cow staging, git resolution) happens in the caller
++ * so this stays deterministic and unit-testable.
++ */
++
++/** Bound read-only when present. Whole `/etc` instead of workspacer's file list: bwrap runs as the user, so a bind cannot expose anything they could not already read. */
++export const BUBBLEWRAP_SYSTEM_MOUNT_CANDIDATES: readonly string[] = [
++  '/nix',
++  '/nix/var/nix/daemon-socket',
++  '/run/current-system',
++  '/usr',
++  '/bin',
++  '/sbin',
++  '/lib',
++  '/lib32',
++  '/lib64',
++  '/opt',
++  '/etc',
++  '/run/systemd/resolve'
++]
++
++export const DEFAULT_SANDBOX_TMP_SIZE_MB = 8192
++export const DEFAULT_SANDBOX_HOME_SIZE_MB = 2048
++
++export type SandboxBindMount = { mode: 'ro' | 'rw'; source: string; target: string }
++
++export type BubblewrapArgsInput = {
++  homeDir: string
++  workdir: string
++  gitCommonDir: string | null
++  /** Existing subset of `BUBBLEWRAP_SYSTEM_MOUNT_CANDIDATES`. */
++  systemMounts: readonly string[]
++  tmpSizeMb: number
++  homeSizeMb: number
++  /** What Orca's own integration needs (hooks, agent config dirs); user mounts can override. */
++  orcaMounts: readonly SandboxBindMount[]
++  /** workspacer `home_*` entries, cow entries already staged and passed as rw. */
++  userHomeMounts: readonly SandboxBindMount[]
++  userEnv: readonly WorkspacerEnvEntry[]
++}
++
++export function resolveSandboxSizeMb(raw: string | undefined, fallback: number): number {
++  const parsed = Number.parseInt(raw?.trim() ?? '', 10)
++  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
++}
++
++export function buildBubblewrapArgs(input: BubblewrapArgsInput): string[] {
++  const args: string[] = ['--unshare-all', '--share-net', '--die-with-parent']
++  args.push('--dev', '/dev', '--proc', '/proc', '--ro-bind', '/sys', '/sys')
++  for (const path of input.systemMounts) {
++    args.push('--ro-bind', path, path)
++  }
++  // Why: RAM-backed and only freed on exit; capped so a runaway write fails loudly instead of eating the machine.
++  args.push('--size', String(input.tmpSizeMb * 1024 * 1024), '--tmpfs', '/tmp')
++  args.push('--size', String(input.homeSizeMb * 1024 * 1024), '--tmpfs', input.homeDir)
++  args.push('--bind', input.workdir, input.workdir)
++  if (input.gitCommonDir) {
++    args.push('--bind', input.gitCommonDir, input.gitCommonDir)
++  }
++  args.push('--chdir', input.workdir)
++  args.push('--setenv', 'HOME', input.homeDir)
++  // Why: lets `ws` refuse nested workspace creation, which would land on the discarded tmpfs home.
++  args.push('--setenv', 'WORKSPACER_SANDBOX', '1')
++  args.push('--setenv', 'ORCA_AGENT_SANDBOX', 'bwrap')
++
++  const createdDirs = new Set<string>([input.homeDir])
++  for (const mount of [...input.orcaMounts, ...input.userHomeMounts]) {
++    for (const dir of parentDirsUnderHome(mount.target, input.homeDir)) {
++      if (!createdDirs.has(dir)) {
++        createdDirs.add(dir)
++        args.push('--dir', dir)
++      }
++    }
++    args.push(mount.mode === 'ro' ? '--ro-bind' : '--bind', mount.source, mount.target)
++  }
++  for (const entry of input.userEnv) {
++    args.push('--setenv', entry.key, entry.value)
++  }
++  return args
++}
++
++/** Ancestors of `target` strictly below `homeDir`, outermost first; empty when outside home. */
++function parentDirsUnderHome(target: string, homeDir: string): string[] {
++  const dirs: string[] = []
++  let parent = dirname(target)
++  while (parent !== homeDir && parent !== dirname(parent)) {
++    dirs.unshift(parent)
++    parent = dirname(parent)
++  }
++  return parent === homeDir ? dirs : []
++}
+diff --git a/src/main/agent-sandbox/bubblewrap-preflight.test.ts b/src/main/agent-sandbox/bubblewrap-preflight.test.ts
+new file mode 100644
+index 0000000000..c294f9829d
+--- /dev/null
++++ b/src/main/agent-sandbox/bubblewrap-preflight.test.ts
+@@ -0,0 +1,74 @@
++import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import {
++  BWRAP_MISSING_MESSAGE,
++  findExecutableInPathSegments,
++  resolveBubblewrapExecutable,
++  USERNS_UNAVAILABLE_MESSAGE
++} from './bubblewrap-preflight'
++
++let root: string
++
++beforeEach(() => {
++  root = mkdtempSync(join(tmpdir(), 'orca-bwrap-preflight-'))
++})
++
++afterEach(() => {
++  rmSync(root, { recursive: true, force: true })
++})
++
++function installFakeBwrap(dir: string): string {
++  mkdirSync(dir, { recursive: true })
++  const path = join(dir, 'bwrap')
++  writeFileSync(path, '#!/bin/sh\nexit 0\n')
++  chmodSync(path, 0o755)
++  return path
++}
++
++describe('findExecutableInPathSegments', () => {
++  it('returns the first executable regular file on the segments', () => {
++    const first = installFakeBwrap(join(root, 'a'))
++    installFakeBwrap(join(root, 'b'))
++    mkdirSync(join(root, 'dir-only', 'bwrap'), { recursive: true })
++    expect(
++      findExecutableInPathSegments('bwrap', [join(root, 'dir-only'), join(root, 'a'), join(root, 'b')])
++    ).toBe(first)
++  })
++
++  it('ignores non-executable files and empty segments', () => {
++    mkdirSync(join(root, 'c'))
++    writeFileSync(join(root, 'c', 'bwrap'), '')
++    chmodSync(join(root, 'c', 'bwrap'), 0o644)
++    expect(findExecutableInPathSegments('bwrap', ['', join(root, 'c')])).toBeNull()
++  })
++})
++
++describe('resolveBubblewrapExecutable', () => {
++  it('returns the bwrap path when found and user namespaces work', async () => {
++    const path = installFakeBwrap(join(root, 'bin'))
++    await expect(
++      resolveBubblewrapExecutable({
++        pathSegments: async () => [join(root, 'bin')],
++        probe: () => true
++      })
++    ).resolves.toBe(path)
++  })
++
++  it('throws a clear error when bwrap is missing', async () => {
++    await expect(
++      resolveBubblewrapExecutable({ pathSegments: async () => [root], probe: () => true })
++    ).rejects.toThrow(BWRAP_MISSING_MESSAGE)
++  })
++
++  it('throws a clear error when user namespaces are unavailable', async () => {
++    installFakeBwrap(join(root, 'bin'))
++    await expect(
++      resolveBubblewrapExecutable({
++        pathSegments: async () => [join(root, 'bin')],
++        probe: () => false
++      })
++    ).rejects.toThrow(USERNS_UNAVAILABLE_MESSAGE)
++  })
++})
+diff --git a/src/main/agent-sandbox/bubblewrap-preflight.ts b/src/main/agent-sandbox/bubblewrap-preflight.ts
+new file mode 100644
+index 0000000000..8522a143ad
+--- /dev/null
++++ b/src/main/agent-sandbox/bubblewrap-preflight.ts
+@@ -0,0 +1,73 @@
++import { accessSync, constants, statSync } from 'node:fs'
++import { delimiter, join } from 'node:path'
++import { runProcessSync } from '../../shared/child-process/run-process'
++import { hydrateShellPath } from '../startup/hydrate-shell-path'
++
++export const BWRAP_MISSING_MESSAGE =
++  'Agent sandbox is enabled but bubblewrap (bwrap) is not installed.'
++export const USERNS_UNAVAILABLE_MESSAGE =
++  'Agent sandbox is enabled but unprivileged user namespaces are not available on this host.'
++
++const USER_NAMESPACE_PROBE_TIMEOUT_MS = 3000
++
++export function findExecutableInPathSegments(
++  name: string,
++  segments: readonly string[]
++): string | null {
++  for (const segment of segments) {
++    if (!segment) {
++      continue
++    }
++    const candidate = join(segment, name)
++    try {
++      if (!statSync(candidate).isFile()) {
++        continue
++      }
++      accessSync(candidate, constants.X_OK)
++      return candidate
++    } catch {
++      continue
++    }
++  }
++  return null
++}
++
++/** Same probe the extracted-AppImage launcher uses to detect a usable userns. */
++export function probeUserNamespaces(run: typeof runProcessSync = runProcessSync): boolean {
++  try {
++    return (
++      run({
++        program: 'unshare',
++        args: ['-Ur', 'true'],
++        stdio: 'ignore',
++        timeoutMs: USER_NAMESPACE_PROBE_TIMEOUT_MS
++      }).code === 0
++    )
++  } catch {
++    return false
++  }
++}
++
++/** Why: the main process PATH is often narrower than the user's shell PATH, so probe the shell's first. */
++async function defaultPathSegments(): Promise<readonly string[]> {
++  const hydrated = await hydrateShellPath()
++  const processSegments = (process.env.PATH ?? '').split(delimiter)
++  return hydrated.ok ? [...hydrated.segments, ...processSegments] : processSegments
++}
++
++export async function resolveBubblewrapExecutable(
++  deps: {
++    pathSegments?: () => Promise<readonly string[]>
++    probe?: () => boolean
++  } = {}
++): Promise<string> {
++  const segments = await (deps.pathSegments ?? defaultPathSegments)()
++  const bwrapPath = findExecutableInPathSegments('bwrap', segments)
++  if (!bwrapPath) {
++    throw new Error(BWRAP_MISSING_MESSAGE)
++  }
++  if (!(deps.probe ?? probeUserNamespaces)()) {
++    throw new Error(USERNS_UNAVAILABLE_MESSAGE)
++  }
++  return bwrapPath
++}
+diff --git a/src/main/agent-sandbox/bubblewrap.integration.test.ts b/src/main/agent-sandbox/bubblewrap.integration.test.ts
+new file mode 100644
+index 0000000000..5945c64bb5
+--- /dev/null
++++ b/src/main/agent-sandbox/bubblewrap.integration.test.ts
+@@ -0,0 +1,80 @@
++import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
++import { homedir } from 'node:os'
++import { delimiter, join } from 'node:path'
++import { describe, expect, it } from 'vitest'
++import { runProcessSync } from '../../shared/child-process/run-process'
++import { BUBBLEWRAP_SYSTEM_MOUNT_CANDIDATES, buildBubblewrapArgs } from './bubblewrap-args'
++import { findExecutableInPathSegments, probeUserNamespaces } from './bubblewrap-preflight'
++import { stageCowMounts } from './agent-sandbox-launch'
++import { readWorkspacerSandboxConfig } from './workspacer-config'
++
++const bwrapPath =
++  process.platform === 'linux'
++    ? findExecutableInPathSegments('bwrap', (process.env.PATH ?? '').split(delimiter))
++    : null
++const canRun = bwrapPath !== null && probeUserNamespaces()
++
++describe.skipIf(!canRun)('bubblewrap sandbox (real bwrap)', () => {
++  it('runs a command with a private home, workspacer mounts and env, and a writable workdir', () => {
++    const root = mkdtempSync(join(process.env.TMPDIR || '/tmp', 'orca-bwrap-it-'))
++    try {
++      const workdir = join(root, 'work')
++      const configDir = join(root, 'cfg')
++      const mounted = join(root, 'mounted-dir')
++      mkdirSync(workdir)
++      mkdirSync(join(configDir, 'home_rw'), { recursive: true })
++      mkdirSync(join(configDir, 'home_cow'), { recursive: true })
++      mkdirSync(mounted)
++      writeFileSync(join(mounted, 'marker'), 'mounted')
++      writeFileSync(join(configDir, 'env'), 'ORCA_IT_ENV=from-env\n')
++      symlinkSync(mounted, join(configDir, 'home_rw', '.orca-it-linked'))
++      writeFileSync(join(configDir, 'home_cow', '.orca-it-cow'), 'original')
++
++      const homeDir = homedir()
++      const config = readWorkspacerSandboxConfig(configDir)
++      const { mounts, stagingDir } = stageCowMounts(config.homeMounts, join(root, 'staging'), homeDir)
++      const args = buildBubblewrapArgs({
++        homeDir,
++        workdir,
++        gitCommonDir: null,
++        systemMounts: BUBBLEWRAP_SYSTEM_MOUNT_CANDIDATES.filter((path) => existsSync(path)),
++        tmpSizeMb: 16,
++        homeSizeMb: 16,
++        orcaMounts: [],
++        userHomeMounts: mounts,
++        userEnv: config.env
++      })
++      const script = [
++        'echo "home=$HOME"',
++        'echo "env=$ORCA_IT_ENV"',
++        'echo "sandbox=$ORCA_AGENT_SANDBOX"',
++        'echo "linked=$(cat "$HOME/.orca-it-linked/marker")"',
++        'echo "cow=$(cat "$HOME/.orca-it-cow")"',
++        'echo "writable=$(test -w "$PWD" && echo yes)"',
++        'echo "home-entries=$(ls -A "$HOME" | wc -l)"',
++        'echo "changed" > "$HOME/.orca-it-cow"'
++      ].join('; ')
++      const result = runProcessSync({
++        program: bwrapPath!,
++        args: [...args, '--', '/bin/sh', '-c', script],
++        timeoutMs: 20_000
++      })
++      expect(result.stderr).toBe('')
++      expect(result.code).toBe(0)
++      expect(result.stdout.trim().split('\n')).toEqual([
++        `home=${homeDir}`,
++        'env=from-env',
++        'sandbox=bwrap',
++        'linked=mounted',
++        'cow=original',
++        'writable=yes',
++        'home-entries=2'
++      ])
++      // Why: cow writes land in the staging copy, never in the config source.
++      expect(existsSync(join(configDir, 'home_cow', '.orca-it-cow'))).toBe(true)
++      expect(stagingDir).not.toBeNull()
++    } finally {
++      rmSync(root, { recursive: true, force: true })
++    }
++  })
++})
+diff --git a/src/main/agent-sandbox/workspacer-config.test.ts b/src/main/agent-sandbox/workspacer-config.test.ts
+new file mode 100644
+index 0000000000..00f2e87188
+--- /dev/null
++++ b/src/main/agent-sandbox/workspacer-config.test.ts
+@@ -0,0 +1,135 @@
++import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, beforeEach, describe, expect, it } from 'vitest'
++import {
++  listWorkspacerHomeMounts,
++  parseWorkspacerEnvFile,
++  readWorkspacerSandboxConfig,
++  resolveWorkspacerConfigDir
++} from './workspacer-config'
++
++describe('resolveWorkspacerConfigDir', () => {
++  it('prefers WORKSPACER_CONFIG_DIR', () => {
++    expect(resolveWorkspacerConfigDir({ WORKSPACER_CONFIG_DIR: '/cfg/ws' }, '/home/u')).toBe(
++      '/cfg/ws'
++    )
++  })
++
++  it('falls back to XDG_CONFIG_HOME/workspacer', () => {
++    expect(resolveWorkspacerConfigDir({ XDG_CONFIG_HOME: '/xdg' }, '/home/u')).toBe(
++      '/xdg/workspacer'
++    )
++  })
++
++  it('defaults to ~/.config/workspacer', () => {
++    expect(resolveWorkspacerConfigDir({}, '/home/u')).toBe('/home/u/.config/workspacer')
++  })
++})
++
++describe('parseWorkspacerEnvFile', () => {
++  it('parses KEY=VALUE lines and strips comments, export and symmetric quotes', () => {
++    const text = [
++      '# comment',
++      '',
++      'PLAIN=value',
++      '  SPACED =  padded  ',
++      'export EXPORTED=1',
++      'DQ="double quoted"',
++      "SQ='single quoted'",
++      'MIXED="keep\'',
++      'not a valid line',
++      '1BAD=x'
++    ].join('\n')
++    expect(parseWorkspacerEnvFile(text)).toEqual([
++      { key: 'PLAIN', value: 'value' },
++      { key: 'SPACED', value: 'padded' },
++      { key: 'EXPORTED', value: '1' },
++      { key: 'DQ', value: 'double quoted' },
++      { key: 'SQ', value: 'single quoted' },
++      { key: 'MIXED', value: '"keep\'' }
++    ])
++  })
++})
++
++describe('listWorkspacerHomeMounts', () => {
++  let root: string
++
++  beforeEach(() => {
++    root = mkdtempSync(join(tmpdir(), 'orca-workspacer-config-'))
++  })
++
++  afterEach(() => {
++    rmSync(root, { recursive: true, force: true })
++  })
++
++  it('returns nothing for a missing tree', () => {
++    expect(listWorkspacerHomeMounts(join(root, 'home_ro'), 'ro')).toEqual([])
++  })
++
++  it('treats files, symlinks and empty dirs as leaves and recurses into real dirs', () => {
++    const tree = join(root, 'home_rw')
++    const real = join(root, 'real-target')
++    mkdirSync(join(tree, '.local', 'share'), { recursive: true })
++    mkdirSync(join(tree, 'empty-dir'))
++    mkdirSync(real)
++    writeFileSync(join(tree, '.gitconfig'), '')
++    symlinkSync(real, join(tree, '.local', 'share', 'linked'))
++    symlinkSync(join(root, 'does-not-exist'), join(tree, '.broken'))
++
++    expect(listWorkspacerHomeMounts(tree, 'rw')).toEqual([
++      { mode: 'rw', source: join(tree, '.gitconfig'), homeRelativePath: '.gitconfig' },
++      {
++        mode: 'rw',
++        source: join(tree, '.local', 'share', 'linked'),
++        homeRelativePath: join('.local', 'share', 'linked')
++      },
++      { mode: 'rw', source: join(tree, 'empty-dir'), homeRelativePath: 'empty-dir' }
++    ])
++  })
++})
++
++describe('readWorkspacerSandboxConfig', () => {
++  let configDir: string
++
++  beforeEach(() => {
++    configDir = mkdtempSync(join(tmpdir(), 'orca-workspacer-config-'))
++  })
++
++  afterEach(() => {
++    rmSync(configDir, { recursive: true, force: true })
++  })
++
++  it('reads env and ro/rw/cow trees in order', () => {
++    writeFileSync(join(configDir, 'env'), 'FOO=bar\n')
++    mkdirSync(join(configDir, 'home_ro'))
++    mkdirSync(join(configDir, 'home_rw'))
++    mkdirSync(join(configDir, 'home_cow'))
++    writeFileSync(join(configDir, 'home_ro', '.bashrc'), '')
++    writeFileSync(join(configDir, 'home_rw', '.claude.json'), '')
++    writeFileSync(join(configDir, 'home_cow', '.npmrc'), '')
++
++    expect(readWorkspacerSandboxConfig(configDir)).toEqual({
++      configDir,
++      env: [{ key: 'FOO', value: 'bar' }],
++      homeMounts: [
++        { mode: 'ro', source: join(configDir, 'home_ro', '.bashrc'), homeRelativePath: '.bashrc' },
++        {
++          mode: 'rw',
++          source: join(configDir, 'home_rw', '.claude.json'),
++          homeRelativePath: '.claude.json'
++        },
++        { mode: 'cow', source: join(configDir, 'home_cow', '.npmrc'), homeRelativePath: '.npmrc' }
++      ]
++    })
++  })
++
++  it('tolerates a missing config dir', () => {
++    const missing = join(configDir, 'nope')
++    expect(readWorkspacerSandboxConfig(missing)).toEqual({
++      configDir: missing,
++      env: [],
++      homeMounts: []
++    })
++  })
++})
+diff --git a/src/main/agent-sandbox/workspacer-config.ts b/src/main/agent-sandbox/workspacer-config.ts
+new file mode 100644
+index 0000000000..dc21cbf616
+--- /dev/null
++++ b/src/main/agent-sandbox/workspacer-config.ts
+@@ -0,0 +1,125 @@
++import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs'
++import { join, relative } from 'node:path'
++
++/**
++ * Reader for workspacer's sandbox config directory (base config only, no profiles).
++ * Layout and semantics mirror `ws.sh` in https://github.com/elsirion/workspacer so an
++ * existing `~/.config/workspacer` works unchanged.
++ */
++
++export type WorkspacerHomeMountMode = 'ro' | 'rw' | 'cow'
++
++export type WorkspacerHomeMount = {
++  mode: WorkspacerHomeMountMode
++  /** Host path bound into the sandbox; a symlink is bound as-is (bwrap follows it). */
++  source: string
++  /** Path relative to `$HOME` inside the sandbox. */
++  homeRelativePath: string
++}
++
++export type WorkspacerEnvEntry = { key: string; value: string }
++
++export type WorkspacerSandboxConfig = {
++  configDir: string
++  env: WorkspacerEnvEntry[]
++  homeMounts: WorkspacerHomeMount[]
++}
++
++const HOME_MOUNT_TREES: readonly { dir: string; mode: WorkspacerHomeMountMode }[] = [
++  { dir: 'home_ro', mode: 'ro' },
++  { dir: 'home_rw', mode: 'rw' },
++  { dir: 'home_cow', mode: 'cow' }
++]
++
++const ENV_LINE = /^([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/
++
++export function resolveWorkspacerConfigDir(env: NodeJS.ProcessEnv, homeDir: string): string {
++  const explicit = env.WORKSPACER_CONFIG_DIR?.trim()
++  if (explicit) {
++    return explicit
++  }
++  const xdgConfigHome = env.XDG_CONFIG_HOME?.trim() || join(homeDir, '.config')
++  return join(xdgConfigHome, 'workspacer')
++}
++
++export function parseWorkspacerEnvFile(text: string): WorkspacerEnvEntry[] {
++  const entries: WorkspacerEnvEntry[] = []
++  for (const rawLine of text.split(/\r?\n/)) {
++    let line = rawLine.trim()
++    if (!line || line.startsWith('#')) {
++      continue
++    }
++    if (/^export\s/.test(line)) {
++      line = line.replace(/^export\s+/, '')
++    }
++    const match = ENV_LINE.exec(line)
++    if (!match) {
++      continue
++    }
++    const value = match[2].trimStart()
++    entries.push({ key: match[1], value: stripSymmetricQuotes(value) })
++  }
++  return entries
++}
++
++function stripSymmetricQuotes(value: string): string {
++  if (value.length >= 2) {
++    const first = value.at(0)
++    const last = value.at(-1)
++    if ((first === '"' || first === "'") && first === last) {
++      return value.slice(1, -1)
++    }
++  }
++  return value
++}
++
++/**
++ * Walks a `home_*` tree. A real directory with children is a container (its children are the
++ * mount points); files, symlinks and empty directories are leaves bound at the same relative
++ * path under `$HOME`.
++ */
++export function listWorkspacerHomeMounts(
++  treeRoot: string,
++  mode: WorkspacerHomeMountMode
++): WorkspacerHomeMount[] {
++  if (!isRealDirectory(treeRoot)) {
++    return []
++  }
++  const mounts: WorkspacerHomeMount[] = []
++  const visit = (dir: string): void => {
++    const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) =>
++      a.name.localeCompare(b.name)
++    )
++    for (const entry of entries) {
++      const entryPath = join(dir, entry.name)
++      if (entry.isDirectory() && readdirSync(entryPath).length > 0) {
++        visit(entryPath)
++        continue
++      }
++      // Why: existsSync follows symlinks, so a dangling link is dropped instead of aborting the launch.
++      if (!existsSync(entryPath)) {
++        continue
++      }
++      mounts.push({ mode, source: entryPath, homeRelativePath: relative(treeRoot, entryPath) })
++    }
++  }
++  visit(treeRoot)
++  return mounts
++}
++
++export function readWorkspacerSandboxConfig(configDir: string): WorkspacerSandboxConfig {
++  const envPath = join(configDir, 'env')
++  const env = existsSync(envPath) ? parseWorkspacerEnvFile(readFileSync(envPath, 'utf8')) : []
++  const homeMounts = HOME_MOUNT_TREES.flatMap(({ dir, mode }) =>
++    listWorkspacerHomeMounts(join(configDir, dir), mode)
++  )
++  return { configDir, env, homeMounts }
++}
++
++function isRealDirectory(path: string): boolean {
++  try {
++    return lstatSync(path).isDirectory()
++  } catch {
++    return false
++  }
++}
+diff --git a/src/main/ipc/pty/runtime/spawn-agent-sandbox.test.ts b/src/main/ipc/pty/runtime/spawn-agent-sandbox.test.ts
+new file mode 100644
+index 0000000000..8c0d878ed7
+--- /dev/null
++++ b/src/main/ipc/pty/runtime/spawn-agent-sandbox.test.ts
+@@ -0,0 +1,100 @@
++import { describe, expect, it, vi } from 'vitest'
++import {
++  applyAgentSandboxToRuntimePtySpawn,
++  shouldSandboxRuntimePtySpawn,
++  type AgentSandboxSpawnGate
++} from './spawn-agent-sandbox'
++import type { RuntimePtySpawnState } from './spawn-state'
++
++function gate(overrides: Partial<AgentSandboxSpawnGate> = {}): AgentSandboxSpawnGate {
++  return {
++    platform: 'linux',
++    settings: { linuxAgentSandboxEnabled: true },
++    connectionId: undefined,
++    launchAgent: 'claude',
++    command: 'claude --dangerously-skip-permissions',
++    wslDistro: null,
++    cwd: '/home/u/ws/repo/feature',
++    ...overrides
++  }
++}
++
++describe('shouldSandboxRuntimePtySpawn', () => {
++  it('is true for a local Linux agent launch with the setting on', () => {
++    expect(shouldSandboxRuntimePtySpawn(gate())).toBe(true)
++  })
++
++  it.each<[string, Partial<AgentSandboxSpawnGate>]>([
++    ['setting off', { settings: { linuxAgentSandboxEnabled: false } }],
++    ['no settings', { settings: undefined }],
++    ['macOS', { platform: 'darwin' }],
++    ['SSH pane', { connectionId: 'ssh:box' }],
++    ['WSL distro', { wslDistro: 'Ubuntu' }],
++    ['plain terminal', { launchAgent: undefined }],
++    ['unknown agent', { launchAgent: 'not-an-agent' }],
++    ['empty command', { command: '   ' }],
++    ['no cwd', { cwd: undefined }]
++  ])('is false for %s', (_label, overrides) => {
++    expect(shouldSandboxRuntimePtySpawn(gate(overrides))).toBe(false)
++  })
++})
++
++describe('applyAgentSandboxToRuntimePtySpawn', () => {
++  function makeCtx(overrides: Partial<RuntimePtySpawnState> = {}): RuntimePtySpawnState {
++    const ctx = {
++      deps: { getSettings: () => ({ linuxAgentSandboxEnabled: true }) },
++      args: { launchAgent: 'claude', connectionId: undefined },
++      cwd: '/home/u/ws/repo/feature',
++      env: { CLAUDE_CONFIG_DIR: '/data/claude-home' },
++      expectedWslDistro: null,
++      launchCommand: 'claude --dangerously-skip-permissions',
++      spawnOptions: { cols: 80, rows: 24, command: 'claude --dangerously-skip-permissions' },
++      ...overrides
++    }
++    // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the sandbox step reads only the fields above; the rest of the spawn state is never touched.
++    return ctx as unknown as RuntimePtySpawnState
++  }
++
++  it('replaces the spawn command and leaves launchCommand untouched', async () => {
++    const ctx = makeCtx()
++    const prepare = vi.fn(async () => 'bwrap … -- /bin/sh -c claude')
++    await applyAgentSandboxToRuntimePtySpawn(ctx, {
++      prepare,
++      platform: 'linux',
++      stagingParent: () => '/tmp/staging'
++    })
++    expect(prepare).toHaveBeenCalledWith(
++      expect.objectContaining({
++        agent: 'claude',
++        command: 'claude --dangerously-skip-permissions',
++        workdir: '/home/u/ws/repo/feature',
++        env: expect.objectContaining({ CLAUDE_CONFIG_DIR: '/data/claude-home' }),
++        stagingParent: '/tmp/staging'
++      })
++    )
++    expect(ctx.spawnOptions.command).toBe('bwrap … -- /bin/sh -c claude')
++    expect(ctx.launchCommand).toBe('claude --dangerously-skip-permissions')
++  })
++
++  it('does nothing when gated off', async () => {
++    const ctx = makeCtx()
++    const prepare = vi.fn(async () => 'never')
++    await applyAgentSandboxToRuntimePtySpawn(ctx, { prepare, platform: 'darwin' })
++    expect(prepare).not.toHaveBeenCalled()
++    expect(ctx.spawnOptions.command).toBe('claude --dangerously-skip-permissions')
++  })
++
++  it('propagates preflight failures so the launch never runs unsandboxed', async () => {
++    const ctx = makeCtx()
++    await expect(
++      applyAgentSandboxToRuntimePtySpawn(ctx, {
++        prepare: async () => {
++          throw new Error('Agent sandbox is enabled but bubblewrap (bwrap) is not installed.')
++        },
++        platform: 'linux',
++        stagingParent: () => '/tmp/staging'
++      })
++    ).rejects.toThrow('bubblewrap (bwrap) is not installed')
++    expect(ctx.spawnOptions.command).toBe('claude --dangerously-skip-permissions')
++  })
++})
+diff --git a/src/main/ipc/pty/runtime/spawn-agent-sandbox.ts b/src/main/ipc/pty/runtime/spawn-agent-sandbox.ts
+new file mode 100644
+index 0000000000..08e4e187ab
+--- /dev/null
++++ b/src/main/ipc/pty/runtime/spawn-agent-sandbox.ts
+@@ -0,0 +1,78 @@
++import { homedir } from 'node:os'
++import { join } from 'node:path'
++import { getAppEnvironment } from '../../../../shared/app-environment'
++import type { GlobalSettings } from '../../../../shared/global-settings-types'
++import { isTuiAgent } from '../../../../shared/tui-agent-config'
++import { prepareAgentSandboxStartupCommand } from '../../../agent-sandbox/agent-sandbox-launch'
++import type { RuntimePtySpawnState } from './spawn-state'
++
++export type AgentSandboxSpawnGate = {
++  platform: NodeJS.Platform
++  settings: Pick<GlobalSettings, 'linuxAgentSandboxEnabled'> | undefined
++  connectionId: string | null | undefined
++  launchAgent: unknown
++  command: string | undefined
++  wslDistro: string | null
++  cwd: string | undefined
++}
++
++/** Local Linux agent launches only: SSH panes execute elsewhere and WSL has its own runtime. */
++export function shouldSandboxRuntimePtySpawn(input: AgentSandboxSpawnGate): boolean {
++  return (
++    input.settings?.linuxAgentSandboxEnabled === true &&
++    input.platform === 'linux' &&
++    !input.connectionId &&
++    input.wslDistro === null &&
++    isTuiAgent(input.launchAgent) &&
++    typeof input.command === 'string' &&
++    input.command.trim().length > 0 &&
++    typeof input.cwd === 'string' &&
++    input.cwd.length > 0
++  )
++}
++
++/**
++ * Rewrites the PTY startup command to run inside bubblewrap. `ctx.launchCommand` stays the plain
++ * agent command so spawn records and Claude-launch detection keep seeing the agent, not bwrap.
++ */
++export async function applyAgentSandboxToRuntimePtySpawn(
++  ctx: RuntimePtySpawnState,
++  deps: {
++    prepare?: typeof prepareAgentSandboxStartupCommand
++    platform?: NodeJS.Platform
++    stagingParent?: () => string
++  } = {}
++): Promise<void> {
++  const command = ctx.spawnOptions.command
++  const cwd = ctx.cwd
++  if (
++    !shouldSandboxRuntimePtySpawn({
++      platform: deps.platform ?? process.platform,
++      settings: ctx.deps.getSettings?.(),
++      connectionId: ctx.args.connectionId,
++      launchAgent: ctx.args.launchAgent,
++      command,
++      wslDistro: ctx.expectedWslDistro,
++      cwd
++    }) ||
++    !isTuiAgent(ctx.args.launchAgent) ||
++    command === undefined ||
++    cwd === undefined
++  ) {
++    return
++  }
++  ctx.spawnOptions.command = await (deps.prepare ?? prepareAgentSandboxStartupCommand)({
++    agent: ctx.args.launchAgent,
++    command,
++    workdir: cwd,
++    // Why: a non-daemon spawn carries only the caller overlay, so the managed config dir may sit in process.env.
++    env: { ...process.env, ...ctx.env },
++    homeDir: homedir(),
++    processEnv: process.env,
++    stagingParent: (deps.stagingParent ?? defaultStagingParent)()
++  })
++}
++
++function defaultStagingParent(): string {
++  return join(getAppEnvironment().getPath('temp'), 'orca-agent-sandbox')
++}
+diff --git a/src/main/ipc/pty/runtime/spawn.ts b/src/main/ipc/pty/runtime/spawn.ts
+index 2af050cd79..c356bf5023 100644
+--- a/src/main/ipc/pty/runtime/spawn.ts
++++ b/src/main/ipc/pty/runtime/spawn.ts
+@@ -13,6 +13,7 @@ import type { PtyRuntimeControllerDeps } from './controller-deps'
+ import { adoptMaterializedRuntimePtySpawn } from './spawn-early'
+ import { prepareRuntimePtySpawn } from './spawn-preflight'
+ import { buildRuntimePtySpawnOptions } from './spawn-options'
++import { applyAgentSandboxToRuntimePtySpawn } from './spawn-agent-sandbox'
+ import { executeRuntimePtySpawn } from './spawn-execute'
+ import { commitRuntimePtySpawn } from './spawn-commit'
+ import { createRuntimePtySpawnState, type RuntimePtySpawnArgs } from './spawn-state'
+@@ -94,6 +95,10 @@ export async function spawnPtyFromRuntimeController(
+     if (earlyReserved) {
+       return toRuntimeSpawnReply(earlyReserved)
+     }
++    await applyAgentSandboxToRuntimePtySpawn(ctx).catch((error: unknown) => {
++      restoreProvisionalPtySize(ctx)
++      throw error
++    })
+     await executeRuntimePtySpawn(ctx)
+     return toRuntimeSpawnReply(await commitRuntimePtySpawn(ctx))
+   } catch (err) {
+diff --git a/src/main/runtime/runtime-client-settings.ts b/src/main/runtime/runtime-client-settings.ts
+index 4e36ee2202..b4370dc11c 100644
+--- a/src/main/runtime/runtime-client-settings.ts
++++ b/src/main/runtime/runtime-client-settings.ts
+@@ -27,6 +27,7 @@ export type RuntimeClientSettings = Pick<
+   | 'agentDefaultArgs'
+   | 'agentDefaultEnv'
+   | 'agentStatusHooksEnabled'
++  | 'linuxAgentSandboxEnabled'
+   | 'terminalCopyTrimsGutter'
+   | 'defaultTaskSource'
+   | 'defaultTaskViewPreset'
+@@ -58,6 +59,7 @@ export type RuntimeHostDisplayLabelOverrides = Partial<
+ export type RuntimeClientSettingsUpdate = Pick<
+   Partial<GlobalSettings>,
+   | 'agentStatusHooksEnabled'
++  | 'linuxAgentSandboxEnabled'
+   | 'defaultTuiAgent'
+   | 'disabledTuiAgents'
+   | 'agentDefaultArgs'
+@@ -98,6 +100,7 @@ export class RuntimeClientSettingsController {
+       agentDefaultArgs: settings.agentDefaultArgs ?? {},
+       agentDefaultEnv: settings.agentDefaultEnv ?? {},
+       agentStatusHooksEnabled: settings.agentStatusHooksEnabled !== false,
++      linuxAgentSandboxEnabled: settings.linuxAgentSandboxEnabled === true,
+       // Why projected: mobile's terminal Copy honours this, and a host predating
+       // the setting sends no key, which the client reads as on (#19770).
+       terminalCopyTrimsGutter: settings.terminalCopyTrimsGutter !== false,
+diff --git a/src/main/runtime/runtime-store-contract.ts b/src/main/runtime/runtime-store-contract.ts
+index b1471ff8ef..7b73cfa80b 100644
+--- a/src/main/runtime/runtime-store-contract.ts
++++ b/src/main/runtime/runtime-store-contract.ts
+@@ -87,6 +87,7 @@ export type RuntimeStore = {
+     terminalWindowsShell?: GlobalSettings['terminalWindowsShell']
+     floatingTerminalEnabled?: GlobalSettings['floatingTerminalEnabled']
+     agentStatusHooksEnabled?: GlobalSettings['agentStatusHooksEnabled']
++    linuxAgentSandboxEnabled?: GlobalSettings['linuxAgentSandboxEnabled']
+     terminalCopyTrimsGutter?: GlobalSettings['terminalCopyTrimsGutter']
+     experimentalNativeChat?: GlobalSettings['experimentalNativeChat']
+     openAgentTabsInChatByDefault?: GlobalSettings['openAgentTabsInChatByDefault']
+diff --git a/src/renderer/src/components/settings/AgentsPane.tsx b/src/renderer/src/components/settings/AgentsPane.tsx
+index 59e139973a..d95ff467c9 100644
+--- a/src/renderer/src/components/settings/AgentsPane.tsx
++++ b/src/renderer/src/components/settings/AgentsPane.tsx
+@@ -14,6 +14,8 @@ import {
+   getAgentGeneratedTabTitlesTitle
+ } from './agent-generated-tab-title-copy'
+ import { getAgentStatusHooksDescription, getAgentStatusHooksTitle } from './agent-status-hooks-copy'
++import { getAgentSandboxDescription, getAgentSandboxTitle } from './agent-sandbox-copy'
++import { isLinuxUserAgent } from '@/components/terminal-pane/pane-helpers'
+ import {
+   SettingsSegmentedControl,
+   SettingsSubsectionHeader,
+@@ -255,6 +257,9 @@ export function AgentsPane({
+         wslCapabilitiesLoading={wslCapabilitiesLoading}
+       />
+       <AgentStatusHooksSetting settings={settings} updateSettings={updateSettings} />
++      {isLinuxUserAgent() ? (
++        <AgentSandboxSetting settings={settings} updateSettings={updateSettings} />
++      ) : null}
+       <AgentGeneratedTabTitlesSetting settings={settings} updateSettings={updateSettings} />
+       {!isPairedWebClientWindow() ? (
+         <AgentAwakeSetting settings={settings} updateSettings={updateSettings} />
+@@ -296,6 +301,22 @@ export function AgentStatusHooksSetting({ settings, updateSettings }: AgentsPane
+   )
+ }
+ 
++/** Linux only: bubblewrap has no macOS or Windows counterpart, so the switch stays hidden there. */
++export function AgentSandboxSetting({ settings, updateSettings }: AgentsPaneProps) {
++  const enabled = settings.linuxAgentSandboxEnabled === true
++  return (
++    <section className="space-y-3">
++      <SettingsSwitchRow
++        label={getAgentSandboxTitle()}
++        description={getAgentSandboxDescription()}
++        checked={enabled}
++        onChange={() => updateSettings({ linuxAgentSandboxEnabled: !enabled })}
++        ariaLabel={getAgentSandboxTitle()}
++      />
++    </section>
++  )
++}
++
+ export function AgentGeneratedTabTitlesSetting({ settings, updateSettings }: AgentsPaneProps) {
+   const enabled = settings.tabAutoGenerateTitle === true
+   return (
+diff --git a/src/renderer/src/components/settings/agent-sandbox-copy.ts b/src/renderer/src/components/settings/agent-sandbox-copy.ts
+new file mode 100644
+index 0000000000..1ee0174abb
+--- /dev/null
++++ b/src/renderer/src/components/settings/agent-sandbox-copy.ts
+@@ -0,0 +1,51 @@
++import { translate } from '@/i18n/i18n'
++import { searchKeywords } from './settings-search-keywords'
++
++const AGENT_SANDBOX_TITLE_KEY = 'auto.components.settings.agent-sandbox-copy.474191c6d2'
++const AGENT_SANDBOX_DESCRIPTION_KEY = 'auto.components.settings.agent-sandbox-copy.8072404c5d'
++
++export function getAgentSandboxTitle(): string {
++  return translate(AGENT_SANDBOX_TITLE_KEY, 'Sandbox local agents (bubblewrap)')
++}
++
++export function getAgentSandboxDescription(): string {
++  return translate(
++    AGENT_SANDBOX_DESCRIPTION_KEY,
++    'Runs locally launched agents inside a bubblewrap sandbox: private home and /tmp, read-only system, workspace read-write. Home mounts and env come from ~/.config/workspacer. Linux only; requires bwrap and unprivileged user namespaces.'
++  )
++}
++
++export function getAgentSandboxSearchKeywords(): string[] {
++  return searchKeywords([
++    {
++      key: 'auto.components.settings.agent-sandbox-copy.f7f53073fc',
++      fallback: 'sandbox',
++      englishOnly: true
++    },
++    {
++      key: 'auto.components.settings.agent-sandbox-copy.e250a085d4',
++      fallback: 'bubblewrap',
++      englishOnly: true
++    },
++    {
++      key: 'auto.components.settings.agent-sandbox-copy.f94e4d0bf1',
++      fallback: 'bwrap',
++      englishOnly: true
++    },
++    {
++      key: 'auto.components.settings.agent-sandbox-copy.a0640a0c2e',
++      fallback: 'isolation',
++      englishOnly: true
++    },
++    {
++      key: 'auto.components.settings.agent-sandbox-copy.e736b5e406',
++      fallback: 'workspacer',
++      englishOnly: true
++    },
++    {
++      key: 'auto.components.settings.agent-sandbox-copy.bdb13ce72e',
++      fallback: 'linux',
++      englishOnly: true
++    }
++  ])
++}
+diff --git a/src/renderer/src/components/settings/agents-search.ts b/src/renderer/src/components/settings/agents-search.ts
+index ed353d5acb..e10060e083 100644
+--- a/src/renderer/src/components/settings/agents-search.ts
++++ b/src/renderer/src/components/settings/agents-search.ts
+@@ -15,6 +15,12 @@ import {
+   getAgentStatusHooksTitle
+ } from './agent-status-hooks-copy'
+ import { getAgentCacheTimerSearchEntries } from './agent-cache-timer-search'
++import {
++  getAgentSandboxDescription,
++  getAgentSandboxSearchKeywords,
++  getAgentSandboxTitle
++} from './agent-sandbox-copy'
++import { isLinuxUserAgent } from '@/components/terminal-pane/pane-helpers'
+ import { translate } from '@/i18n/i18n'
+ import { searchKeywords, translateSearchKeyword, uniqueKeywords } from './settings-search-keywords'
+ import { createLocalizedCatalog } from '@/i18n/localized-catalog'
+@@ -108,6 +114,15 @@ const getAllAgentsPaneSearchEntries = createLocalizedCatalog(() => [
+     description: getAgentStatusHooksDescription(),
+     keywords: getAgentStatusHooksSearchKeywords()
+   },
++  ...(isLinuxUserAgent()
++    ? [
++        {
++          title: getAgentSandboxTitle(),
++          description: getAgentSandboxDescription(),
++          keywords: getAgentSandboxSearchKeywords()
++        }
++      ]
++    : []),
+   {
+     title: getAgentGeneratedTabTitlesTitle(),
+     description: getAgentGeneratedTabTitlesDescription(),
+diff --git a/src/renderer/src/i18n/en-runtime-required.json b/src/renderer/src/i18n/en-runtime-required.json
+index 8707f0d0ad..4a9167f603 100644
+--- a/src/renderer/src/i18n/en-runtime-required.json
++++ b/src/renderer/src/i18n/en-runtime-required.json
+@@ -1540,6 +1540,16 @@
+           "19ad21615a": "Auto-generate tab titles",
+           "b036c7a409": "Derive short stable tab names from the first known agent prompt. Manual renames always win."
+         },
++        "agent-sandbox-copy": {
++          "474191c6d2": "Sandbox local agents (bubblewrap)",
++          "8072404c5d": "Runs locally launched agents inside a bubblewrap sandbox: private home and /tmp, read-only system, workspace read-write. Home mounts and env come from ~/.config/workspacer. Linux only; requires bwrap and unprivileged user namespaces.",
++          "a0640a0c2e": "isolation",
++          "bdb13ce72e": "linux",
++          "e250a085d4": "bubblewrap",
++          "e736b5e406": "workspacer",
++          "f7f53073fc": "sandbox",
++          "f94e4d0bf1": "bwrap"
++        },
+         "agent-status-hooks-copy": {
+           "7707c15abb": "Agent status hooks",
+           "a68a642835": "Shows working, waiting, and done states in Orca. Turn off to remove Orca-managed hooks and stop reinstalling them."
+diff --git a/src/renderer/src/i18n/locales/en.json b/src/renderer/src/i18n/locales/en.json
+index aecae8bc23..7854f66e65 100644
+--- a/src/renderer/src/i18n/locales/en.json
++++ b/src/renderer/src/i18n/locales/en.json
+@@ -10621,6 +10621,16 @@
+           "7707c15abb": "Agent status hooks",
+           "a68a642835": "Shows working, waiting, and done states in Orca. Turn off to remove Orca-managed hooks and stop reinstalling them."
+         },
++        "agent-sandbox-copy": {
++          "474191c6d2": "Sandbox local agents (bubblewrap)",
++          "8072404c5d": "Runs locally launched agents inside a bubblewrap sandbox: private home and /tmp, read-only system, workspace read-write. Home mounts and env come from ~/.config/workspacer. Linux only; requires bwrap and unprivileged user namespaces.",
++          "f7f53073fc": "sandbox",
++          "e250a085d4": "bubblewrap",
++          "f94e4d0bf1": "bwrap",
++          "a0640a0c2e": "isolation",
++          "e736b5e406": "workspacer",
++          "bdb13ce72e": "linux"
++        },
+         "agent-generated-tab-title-copy": {
+           "19ad21615a": "Auto-generate tab titles",
+           "b036c7a409": "Derive short stable tab names from the first known agent prompt. Manual renames always win."
+diff --git a/src/shared/default-global-settings.ts b/src/shared/default-global-settings.ts
+index c11d05dc75..e6e1cb59e8 100644
+--- a/src/shared/default-global-settings.ts
++++ b/src/shared/default-global-settings.ts
+@@ -209,6 +209,7 @@ export function buildDefaultSettings(args: {
+     agentDefaultEnv: { ...DEFAULT_TUI_AGENT_ENV },
+     agentYoloDefaultsMigrated: true,
+     agentStatusHooksEnabled: true,
++    linuxAgentSandboxEnabled: false,
+     tabAutoGenerateTitle: false,
+     confirmClosePinnedTab: true,
+     keepComputerAwakeWhileAgentsRun: false,
+diff --git a/src/shared/global-settings-types.ts b/src/shared/global-settings-types.ts
+index 6369033c89..27525a1286 100644
+--- a/src/shared/global-settings-types.ts
++++ b/src/shared/global-settings-types.ts
+@@ -392,6 +392,8 @@ export type GlobalSettings = {
+   agentYoloDefaultsMigrated?: boolean
+   /** Why: disabling must persist so startup doesn't reinstall global agent hook entries the user just removed. */
+   agentStatusHooksEnabled: boolean
++  /** Linux only: wrap locally launched agents in a bubblewrap sandbox driven by ~/.config/workspacer. */
++  linuxAgentSandboxEnabled?: boolean
+   /** Dismissed freshness tuples: no write authority, just suppress re-nudging the same official placement/revision. */
+   dismissedSkillFreshnessNudges?: string[]
+   /** Why: generated tab titles are subjective, so they stay opt-in and manual renames win. */
+diff --git a/src/shared/rpc-contract/client-settings-params.ts b/src/shared/rpc-contract/client-settings-params.ts
+index def24ddc70..68b6f82ff2 100644
+--- a/src/shared/rpc-contract/client-settings-params.ts
++++ b/src/shared/rpc-contract/client-settings-params.ts
+@@ -107,6 +107,7 @@ export const SettingsUpdate = z
+       .optional(),
+     experimentalNewWorktreeCardStyle: z.boolean().optional(),
+     agentStatusHooksEnabled: z.boolean().optional(),
++    linuxAgentSandboxEnabled: z.boolean().optional(),
+     defaultRepoSelection: z.array(z.string()).nullable().optional(),
+     defaultLinearTeamSelection: z.array(z.string()).nullable().optional(),
+     compactWorktreeCards: z.boolean().optional(),
+diff --git a/src/shared/tui-agent-launch-customization.test.ts b/src/shared/tui-agent-launch-customization.test.ts
+new file mode 100644
+index 0000000000..0ca7f54b9f
+--- /dev/null
++++ b/src/shared/tui-agent-launch-customization.test.ts
+@@ -0,0 +1,23 @@
++import { describe, expect, it } from 'vitest'
++import { hasExplicitTuiLaunchCustomization } from './tui-agent-launch-customization'
++
++describe('hasExplicitTuiLaunchCustomization', () => {
++  it('is false without any customization', () => {
++    expect(hasExplicitTuiLaunchCustomization({}, 'claude')).toBe(false)
++    expect(hasExplicitTuiLaunchCustomization({ linuxAgentSandboxEnabled: false }, 'claude')).toBe(
++      false
++    )
++  })
++
++  it('forces the terminal route when the Linux agent sandbox is on', () => {
++    expect(hasExplicitTuiLaunchCustomization({ linuxAgentSandboxEnabled: true }, 'claude')).toBe(
++      true
++    )
++  })
++
++  it('still detects a command override', () => {
++    expect(
++      hasExplicitTuiLaunchCustomization({ agentCmdOverrides: { claude: 'my-claude' } }, 'claude')
++    ).toBe(true)
++  })
++})
+diff --git a/src/shared/tui-agent-launch-customization.ts b/src/shared/tui-agent-launch-customization.ts
+index b31edff8a0..40ae3ea836 100644
+--- a/src/shared/tui-agent-launch-customization.ts
++++ b/src/shared/tui-agent-launch-customization.ts
+@@ -11,7 +11,12 @@ import { getTuiAgentDefaultArgs, getTuiAgentDefaultEnv } from './tui-agent-launc
+  */
+ export function hasExplicitTuiLaunchCustomization(
+   settings:
+-    | Partial<Pick<GlobalSettings, 'agentCmdOverrides' | 'agentDefaultArgs' | 'agentDefaultEnv'>>
++    | Partial<
++        Pick<
++          GlobalSettings,
++          'agentCmdOverrides' | 'agentDefaultArgs' | 'agentDefaultEnv' | 'linuxAgentSandboxEnabled'
++        >
++      >
+     | null
+     | undefined,
+   agent: TuiAgent
+@@ -24,6 +29,8 @@ export function hasExplicitTuiLaunchCustomization(
+     (Object.keys(configuredEnv).length !== Object.keys(defaultEnv).length ||
+       Object.entries(configuredEnv).some(([key, value]) => defaultEnv[key] !== value))
+   return (
++    // Why: the sandbox wraps the PTY command, so a sandboxed launch must stay on the terminal route.
++    settings?.linuxAgentSandboxEnabled === true ||
+     Boolean(settings?.agentCmdOverrides?.[agent]?.trim()) ||
+     hasExplicitTuiAgentArgs(agent, configuredArgs) ||
+     envIsCustomized
+-- 
+2.55.0
+
