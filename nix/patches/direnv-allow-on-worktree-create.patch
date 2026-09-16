@@ -1,0 +1,321 @@
+From 2ca89289140d04fd15764a3fc9627e70d33ebe73 Mon Sep 17 00:00:00 2001
+From: elsirion <elsirion@protonmail.com>
+Date: Wed, 16 Sep 2026 14:08:51 +0200
+Subject: [PATCH] feat(worktrees): allow a new worktree's .envrc with direnv
+
+direnv keys its allow list by path and content, so every worktree Orca
+creates starts with a blocked `.envrc` even when the same file is
+trusted in the main checkout, and shells and agents in it run without
+the project environment until someone runs `direnv allow`. Mirror what
+workspacer-style tools do: after a successful local `git worktree add`,
+run `direnv allow` on the checkout's `.envrc` when direnv is installed.
+
+`--no-checkout` adds have no `.envrc` yet and WSL checkouts belong to
+the distro's direnv, so both are skipped. A missing direnv is silent;
+any other failure is a warning and never fails the create.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ docs/site/content/docs/model/worktrees.mdx    |  2 +-
+ src/main/direnv/direnv-worktree-allow.test.ts | 74 ++++++++++++++++++
+ src/main/direnv/direnv-worktree-allow.ts      | 75 +++++++++++++++++++
+ .../git/worktree-add-direnv-allow.test.ts     | 75 +++++++++++++++++++
+ src/main/git/worktree-add.ts                  |  9 ++-
+ 5 files changed, 233 insertions(+), 2 deletions(-)
+ create mode 100644 src/main/direnv/direnv-worktree-allow.test.ts
+ create mode 100644 src/main/direnv/direnv-worktree-allow.ts
+ create mode 100644 src/main/git/worktree-add-direnv-allow.test.ts
+
+diff --git a/docs/site/content/docs/model/worktrees.mdx b/docs/site/content/docs/model/worktrees.mdx
+index f71d21c2ca..33ed832124 100644
+--- a/docs/site/content/docs/model/worktrees.mdx
++++ b/docs/site/content/docs/model/worktrees.mdx
+@@ -24,7 +24,7 @@ Orca is worktree-native. Instead of branching and stashing on one checkout, ever
+ 
+ ## Creation runs in the background
+ 
+-Submitting the Create Worktree dialog closes it immediately — the `git fetch` and `git worktree add` work continues in the background while you keep using Orca. The new worktree appears in the sidebar with a progress row, and the worktree's tab shows live setup status until the checkout finishes and swaps to the terminal. You can switch to other worktrees while a create is in flight, watch the progress, or cancel it from the in-tab panel. If creation fails, the panel surfaces the error with a Retry.
++Submitting the Create Worktree dialog closes it immediately — the `git fetch` and `git worktree add` work continues in the background while you keep using Orca. The new worktree appears in the sidebar with a progress row, and the worktree's tab shows live setup status until the checkout finishes and swaps to the terminal. You can switch to other worktrees while a create is in flight, watch the progress, or cancel it from the in-tab panel. If creation fails, the panel surfaces the error with a Retry. When the new checkout contains an `.envrc` and `direnv` is installed, Orca runs `direnv allow` on it, the same way workspacer-style tools do, so shells and agents in that worktree load the project environment without a manual approval; a worktree in WSL is left to the distro's direnv.
+ 
+ ## Start-from picker
+ 
+diff --git a/src/main/direnv/direnv-worktree-allow.test.ts b/src/main/direnv/direnv-worktree-allow.test.ts
+new file mode 100644
+index 0000000000..ff6fe4e134
+--- /dev/null
++++ b/src/main/direnv/direnv-worktree-allow.test.ts
+@@ -0,0 +1,74 @@
++import { delimiter } from 'node:path'
++import { describe, expect, it, vi } from 'vitest'
++import type { ProcessResult } from '../../shared/child-process/process-spec'
++import { allowDirenvForWorktree } from './direnv-worktree-allow'
++
++function exited(overrides: Partial<ProcessResult> = {}): ProcessResult {
++  return { code: 0, signal: null, stdout: '', stderr: '', timedOut: false, ...overrides }
++}
++
++function okRun() {
++  return vi.fn(async () => exited())
++}
++
++describe('allowDirenvForWorktree', () => {
++  it('runs `direnv allow` on the worktree .envrc with the shell PATH', async () => {
++    const run = okRun()
++    await expect(
++      allowDirenvForWorktree('/w/feature', {
++        platform: 'linux',
++        exists: (path) => path === '/w/feature/.envrc',
++        pathSegments: async () => ['/home/u/.nix-profile/bin', '/usr/bin'],
++        run
++      })
++    ).resolves.toBe('allowed')
++    expect(run).toHaveBeenCalledWith(
++      expect.objectContaining({
++        program: 'direnv',
++        args: ['allow', '/w/feature/.envrc'],
++        cwd: '/w/feature',
++        env: expect.objectContaining({
++          PATH: ['/home/u/.nix-profile/bin', '/usr/bin'].join(delimiter)
++        })
++      })
++    )
++  })
++
++  it('does nothing without an .envrc or on Windows', async () => {
++    const run = okRun()
++    await expect(
++      allowDirenvForWorktree('/w/feature', { platform: 'linux', exists: () => false, run })
++    ).resolves.toBe('no-envrc')
++    await expect(
++      allowDirenvForWorktree('/w/feature', { platform: 'win32', exists: () => true, run })
++    ).resolves.toBe('unsupported-platform')
++    expect(run).not.toHaveBeenCalled()
++  })
++
++  it('reports a missing direnv without warning and a failure with a warning', async () => {
++    const warn = vi.fn()
++    const missing = Object.assign(new Error('spawn direnv ENOENT'), { code: 'ENOENT' })
++    await expect(
++      allowDirenvForWorktree('/w/feature', {
++        platform: 'linux',
++        exists: () => true,
++        pathSegments: async () => [],
++        run: vi.fn(async () => {
++          throw missing
++        }),
++        warn
++      })
++    ).resolves.toBe('direnv-missing')
++    expect(warn).not.toHaveBeenCalled()
++    await expect(
++      allowDirenvForWorktree('/w/feature', {
++        platform: 'linux',
++        exists: () => true,
++        pathSegments: async () => [],
++        run: vi.fn(async () => exited({ code: 1, stderr: 'boom\n' })),
++        warn
++      })
++    ).resolves.toBe('failed')
++    expect(warn).toHaveBeenCalledWith('direnv allow failed for /w/feature/.envrc: boom')
++  })
++})
+diff --git a/src/main/direnv/direnv-worktree-allow.ts b/src/main/direnv/direnv-worktree-allow.ts
+new file mode 100644
+index 0000000000..5c52c326e7
+--- /dev/null
++++ b/src/main/direnv/direnv-worktree-allow.ts
+@@ -0,0 +1,75 @@
++import { existsSync } from 'node:fs'
++import { delimiter, join } from 'node:path'
++import { runProcess } from '../../shared/child-process/run-process'
++import { hydrateShellPath } from '../startup/hydrate-shell-path'
++
++const DIRENV_ALLOW_TIMEOUT_MS = 10_000
++
++export type DirenvAllowOutcome =
++  | 'allowed'
++  | 'no-envrc'
++  | 'direnv-missing'
++  | 'failed'
++  | 'unsupported-platform'
++
++export type DirenvAllowDeps = {
++  platform?: NodeJS.Platform
++  exists?: (path: string) => boolean
++  pathSegments?: () => Promise<readonly string[]>
++  run?: typeof runProcess
++  warn?: (message: string) => void
++}
++
++/** Why: the main process PATH is often narrower than the user's shell PATH, where direnv lives. */
++async function defaultPathSegments(): Promise<readonly string[]> {
++  const hydrated = await hydrateShellPath()
++  const processSegments = (process.env.PATH ?? '').split(delimiter)
++  return hydrated.ok ? [...hydrated.segments, ...processSegments] : processSegments
++}
++
++function isMissingExecutable(error: unknown): boolean {
++  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT'
++}
++
++/**
++ * Allows a freshly created worktree's `.envrc`, the way workspacer's `ws` does on entering a
++ * workspace. direnv keys its allow list by path and content, so a new checkout of an already
++ * trusted `.envrc` still starts blocked; without this every new worktree needs a manual
++ * `direnv allow` before shells and agents load the project environment.
++ */
++export async function allowDirenvForWorktree(
++  worktreePath: string,
++  deps: DirenvAllowDeps = {}
++): Promise<DirenvAllowOutcome> {
++  const platform = deps.platform ?? process.platform
++  const exists = deps.exists ?? existsSync
++  const warn = deps.warn ?? ((message: string) => console.warn(message))
++  if (platform === 'win32') {
++    return 'unsupported-platform'
++  }
++  const envrcPath = join(worktreePath, '.envrc')
++  if (!exists(envrcPath)) {
++    return 'no-envrc'
++  }
++  const segments = await (deps.pathSegments ?? defaultPathSegments)()
++  try {
++    const result = await (deps.run ?? runProcess)({
++      program: 'direnv',
++      args: ['allow', envrcPath],
++      cwd: worktreePath,
++      env: { ...process.env, PATH: segments.join(delimiter) },
++      timeoutMs: DIRENV_ALLOW_TIMEOUT_MS
++    })
++    if (result.code === 0) {
++      return 'allowed'
++    }
++    warn(`direnv allow failed for ${envrcPath}: ${result.stderr.trim()}`)
++    return 'failed'
++  } catch (error) {
++    if (isMissingExecutable(error)) {
++      return 'direnv-missing'
++    }
++    warn(`direnv allow failed for ${envrcPath}: ${String(error)}`)
++    return 'failed'
++  }
++}
+diff --git a/src/main/git/worktree-add-direnv-allow.test.ts b/src/main/git/worktree-add-direnv-allow.test.ts
+new file mode 100644
+index 0000000000..7b9c8fdf58
+--- /dev/null
++++ b/src/main/git/worktree-add-direnv-allow.test.ts
+@@ -0,0 +1,75 @@
++// addWorktree: a fresh checkout gets its .envrc allowed; --no-checkout and WSL checkouts do not.
++import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
++
++const { gitExecFileAsyncMock, gitExecFileSyncMock, allowDirenvForWorktreeMock } = vi.hoisted(
++  () => ({
++    gitExecFileAsyncMock: vi.fn(),
++    gitExecFileSyncMock: vi.fn(),
++    allowDirenvForWorktreeMock: vi.fn(async () => 'allowed' as const)
++  })
++)
++
++vi.mock('./runner', () => ({
++  gitExecFileAsync: gitExecFileAsyncMock,
++  gitExecFileSync: gitExecFileSyncMock,
++  translateWslOutputPaths: vi.fn((output: string) => output)
++}))
++
++vi.mock('../direnv/direnv-worktree-allow', () => ({
++  allowDirenvForWorktree: allowDirenvForWorktreeMock
++}))
++
++import { addWorktree } from './worktree'
++import { registerWorktreeSuiteHooks } from './worktree-test-harness'
++
++registerWorktreeSuiteHooks()
++
++describe('addWorktree direnv allow', () => {
++  let platformSpy: MockInstance<() => NodeJS.Platform>
++
++  beforeEach(() => {
++    gitExecFileAsyncMock.mockReset()
++    gitExecFileSyncMock.mockReset()
++    allowDirenvForWorktreeMock.mockClear()
++    platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('linux')
++  })
++
++  afterEach(() => {
++    platformSpy.mockRestore()
++  })
++
++  it('allows the new checkout after an existing-branch add', async () => {
++    gitExecFileAsyncMock.mockResolvedValueOnce({ stdout: '' }) // worktree add
++    await addWorktree('/repo', '/repo-feature', 'feature/test', 'feature/test', false, false, {
++      checkoutExistingBranch: true
++    })
++    expect(allowDirenvForWorktreeMock).toHaveBeenCalledWith('/repo-feature')
++  })
++
++  it('skips --no-checkout adds, which have no .envrc yet', async () => {
++    gitExecFileAsyncMock.mockResolvedValueOnce({ stdout: '' }) // worktree add
++    await addWorktree('/repo', '/repo-feature', 'feature/test', 'feature/test', false, true, {
++      checkoutExistingBranch: true
++    })
++    expect(allowDirenvForWorktreeMock).not.toHaveBeenCalled()
++  })
++
++  it('leaves WSL checkouts to the distro direnv', async () => {
++    gitExecFileAsyncMock.mockResolvedValueOnce({ stdout: '' }) // worktree add
++    await addWorktree('/repo', '/repo-feature', 'feature/test', 'feature/test', false, false, {
++      checkoutExistingBranch: true,
++      wslDistro: 'Ubuntu'
++    })
++    expect(allowDirenvForWorktreeMock).not.toHaveBeenCalled()
++  })
++
++  it('does not allow anything when the add itself fails', async () => {
++    gitExecFileAsyncMock.mockRejectedValueOnce(new Error('worktree add failed'))
++    await expect(
++      addWorktree('/repo', '/repo-feature', 'feature/test', 'feature/test', false, false, {
++        checkoutExistingBranch: true
++      })
++    ).rejects.toThrow('worktree add failed')
++    expect(allowDirenvForWorktreeMock).not.toHaveBeenCalled()
++  })
++})
+diff --git a/src/main/git/worktree-add.ts b/src/main/git/worktree-add.ts
+index 380f3a3cc3..7e318edd4d 100644
+--- a/src/main/git/worktree-add.ts
++++ b/src/main/git/worktree-add.ts
+@@ -5,6 +5,7 @@ import type {
+ } from '../../shared/worktree/base-ref-drift-types'
+ import { windowsLongPathGitArgs } from '../../shared/windows-long-path-git-args'
+ import { withRepoRefMaintenancePaused } from './local-repo-ref-maintenance'
++import { allowDirenvForWorktree } from '../direnv/direnv-worktree-allow'
+ import { gitExecFileAsync } from './runner'
+ import { runWithGitReadCacheInvalidation } from './status'
+ import { invalidateWslLinkedWorktreeGitRouting } from './wsl-linked-worktree-git-routing'
+@@ -156,8 +157,9 @@ export async function addWorktree(
+   noCheckout = false,
+   options: AddWorktreeOptions = {}
+ ): Promise<AddWorktreeResult> {
++  let result: AddWorktreeResult
+   try {
+-    return await withRepoRefMaintenancePaused('worktree-add', () =>
++    result = await withRepoRefMaintenancePaused('worktree-add', () =>
+       runWithGitReadCacheInvalidation(() =>
+         performAddWorktree(
+           repoPath,
+@@ -173,6 +175,11 @@ export async function addWorktree(
+   } finally {
+     bumpWorktreeScanGeneration(repoPath)
+   }
++  // Why: a WSL checkout's direnv lives in the distro, and --no-checkout has no .envrc yet.
++  if (!noCheckout && !options.wslDistro) {
++    await allowDirenvForWorktree(worktreePath)
++  }
++  return result
+ }
+ 
+ async function performAddWorktree(
+-- 
+2.55.0
+

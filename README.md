@@ -67,9 +67,10 @@ Nixpkgs (the flake's locked revision is the tested version).
 
 The default package is not a pure release: its bundled JavaScript is rebuilt from the
 upstream tag pinned in `nix/release.json` with the patches listed in
-[`nix/source-overlay.json`](nix/source-overlay.json) applied (currently the
-[Linux bubblewrap agent sandbox](nix/patches/linux-agent-bubblewrap-sandbox.patch),
-proposed upstream from [elsirion/orca](https://github.com/elsirion/orca)). Only
+[`nix/source-overlay.json`](nix/source-overlay.json) applied, both proposed upstream
+from [elsirion/orca](https://github.com/elsirion/orca): the
+[Linux bubblewrap agent sandbox](nix/patches/linux-agent-bubblewrap-sandbox.patch)
+and [`direnv allow` for freshly created worktrees](nix/patches/direnv-allow-on-worktree-create.patch). Only
 `out/` inside `app.asar` is replaced; Electron and every native module still come
 from the release AppImage, so the ABI contract above is unchanged.
 

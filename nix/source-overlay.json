@@ -3,6 +3,7 @@
   "sourceHash": "sha256-j3XeyvsYNaD5njOu7uUXCz+u39iPhmEl7nOzu1wonCo=",
   "pnpmDepsHash": "sha256-U+Jn8dMBnj2cSBgJDkAiXbimyMNOAb25YKv2ufPPTYw=",
   "patches": [
-    "linux-agent-bubblewrap-sandbox.patch"
+    "linux-agent-bubblewrap-sandbox.patch",
+    "direnv-allow-on-worktree-create.patch"
   ]
 }
