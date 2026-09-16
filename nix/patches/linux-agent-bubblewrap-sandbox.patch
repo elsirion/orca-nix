@@ -1,4 +1,4 @@
-From b347a57db02c7c1b566dbfa0fd9516b7b61e05b9 Mon Sep 17 00:00:00 2001
+From ccabba5a9434778dcff67f5c6a897643ab05e9c7 Mon Sep 17 00:00:00 2001
 From: elsirion <elsirion@protonmail.com>
 Date: Tue, 15 Sep 2026 20:33:10 +0200
 Subject: [PATCH] feat(agents): opt-in bubblewrap sandbox for local Linux agent
@@ -39,8 +39,9 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  .../bubblewrap.integration.test.ts            |  80 ++++++
  .../agent-sandbox/workspacer-config.test.ts   | 135 ++++++++++
  src/main/agent-sandbox/workspacer-config.ts   | 125 +++++++++
- .../pty/runtime/spawn-agent-sandbox.test.ts   | 100 +++++++
- .../ipc/pty/runtime/spawn-agent-sandbox.ts    |  78 ++++++
+ .../ipc/pty/agent-sandbox-spawn-step.test.ts  | 104 ++++++++
+ src/main/ipc/pty/agent-sandbox-spawn-step.ts  |  90 +++++++
+ src/main/ipc/pty/ipc/spawn-run.ts             |   5 +
  src/main/ipc/pty/runtime/spawn.ts             |   5 +
  src/main/runtime/runtime-client-settings.ts   |   3 +
  src/main/runtime/runtime-store-contract.ts    |   1 +
@@ -54,7 +55,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  .../rpc-contract/client-settings-params.ts    |   1 +
  .../tui-agent-launch-customization.test.ts    |  23 ++
  src/shared/tui-agent-launch-customization.ts  |   9 +-
- 26 files changed, 1497 insertions(+), 2 deletions(-)
+ 27 files changed, 1518 insertions(+), 2 deletions(-)
  create mode 100644 src/main/agent-sandbox/agent-sandbox-launch.test.ts
  create mode 100644 src/main/agent-sandbox/agent-sandbox-launch.ts
  create mode 100644 src/main/agent-sandbox/bubblewrap-args.test.ts
@@ -64,8 +65,8 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
  create mode 100644 src/main/agent-sandbox/bubblewrap.integration.test.ts
  create mode 100644 src/main/agent-sandbox/workspacer-config.test.ts
  create mode 100644 src/main/agent-sandbox/workspacer-config.ts
- create mode 100644 src/main/ipc/pty/runtime/spawn-agent-sandbox.test.ts
- create mode 100644 src/main/ipc/pty/runtime/spawn-agent-sandbox.ts
+ create mode 100644 src/main/ipc/pty/agent-sandbox-spawn-step.test.ts
+ create mode 100644 src/main/ipc/pty/agent-sandbox-spawn-step.ts
  create mode 100644 src/renderer/src/components/settings/agent-sandbox-copy.ts
  create mode 100644 src/shared/tui-agent-launch-customization.test.ts
 
@@ -1314,19 +1315,21 @@ index 0000000000..dc21cbf616
 +    return false
 +  }
 +}
-diff --git a/src/main/ipc/pty/runtime/spawn-agent-sandbox.test.ts b/src/main/ipc/pty/runtime/spawn-agent-sandbox.test.ts
+diff --git a/src/main/ipc/pty/agent-sandbox-spawn-step.test.ts b/src/main/ipc/pty/agent-sandbox-spawn-step.test.ts
 new file mode 100644
-index 0000000000..8c0d878ed7
+index 0000000000..eba7a7c534
 --- /dev/null
-+++ b/src/main/ipc/pty/runtime/spawn-agent-sandbox.test.ts
-@@ -0,0 +1,100 @@
++++ b/src/main/ipc/pty/agent-sandbox-spawn-step.test.ts
+@@ -0,0 +1,104 @@
 +import { describe, expect, it, vi } from 'vitest'
 +import {
-+  applyAgentSandboxToRuntimePtySpawn,
++  applyAgentSandboxToPtySpawn,
 +  shouldSandboxRuntimePtySpawn,
++  type AgentSandboxSpawnContext,
 +  type AgentSandboxSpawnGate
-+} from './spawn-agent-sandbox'
-+import type { RuntimePtySpawnState } from './spawn-state'
++} from './agent-sandbox-spawn-step'
++import type { PtyIpcSpawnState } from './ipc/spawn-state'
++import type { RuntimePtySpawnState } from './runtime/spawn-state'
 +
 +function gate(overrides: Partial<AgentSandboxSpawnGate> = {}): AgentSandboxSpawnGate {
 +  return {
@@ -1361,26 +1364,29 @@ index 0000000000..8c0d878ed7
 +  })
 +})
 +
-+describe('applyAgentSandboxToRuntimePtySpawn', () => {
-+  function makeCtx(overrides: Partial<RuntimePtySpawnState> = {}): RuntimePtySpawnState {
-+    const ctx = {
++describe('applyAgentSandboxToPtySpawn', () => {
++  // Why: compile-time proof that both real pipeline states satisfy the shared context type.
++  const acceptsRuntimeState = (ctx: RuntimePtySpawnState): AgentSandboxSpawnContext => ctx
++  const acceptsIpcState = (ctx: PtyIpcSpawnState): AgentSandboxSpawnContext => ctx
++  void acceptsRuntimeState
++  void acceptsIpcState
++
++  function makeCtx(overrides: Partial<AgentSandboxSpawnContext> = {}): AgentSandboxSpawnContext {
++    return {
 +      deps: { getSettings: () => ({ linuxAgentSandboxEnabled: true }) },
 +      args: { launchAgent: 'claude', connectionId: undefined },
 +      cwd: '/home/u/ws/repo/feature',
 +      env: { CLAUDE_CONFIG_DIR: '/data/claude-home' },
 +      expectedWslDistro: null,
-+      launchCommand: 'claude --dangerously-skip-permissions',
-+      spawnOptions: { cols: 80, rows: 24, command: 'claude --dangerously-skip-permissions' },
++      spawnOptions: { command: 'claude --dangerously-skip-permissions' },
 +      ...overrides
 +    }
-+    // oxlint-disable-next-line typescript/consistent-type-assertions -- SAFETY: the sandbox step reads only the fields above; the rest of the spawn state is never touched.
-+    return ctx as unknown as RuntimePtySpawnState
 +  }
 +
-+  it('replaces the spawn command and leaves launchCommand untouched', async () => {
++  it('replaces the spawn command', async () => {
 +    const ctx = makeCtx()
 +    const prepare = vi.fn(async () => 'bwrap … -- /bin/sh -c claude')
-+    await applyAgentSandboxToRuntimePtySpawn(ctx, {
++    await applyAgentSandboxToPtySpawn(ctx, {
 +      prepare,
 +      platform: 'linux',
 +      stagingParent: () => '/tmp/staging'
@@ -1395,13 +1401,12 @@ index 0000000000..8c0d878ed7
 +      })
 +    )
 +    expect(ctx.spawnOptions.command).toBe('bwrap … -- /bin/sh -c claude')
-+    expect(ctx.launchCommand).toBe('claude --dangerously-skip-permissions')
 +  })
 +
 +  it('does nothing when gated off', async () => {
 +    const ctx = makeCtx()
 +    const prepare = vi.fn(async () => 'never')
-+    await applyAgentSandboxToRuntimePtySpawn(ctx, { prepare, platform: 'darwin' })
++    await applyAgentSandboxToPtySpawn(ctx, { prepare, platform: 'darwin' })
 +    expect(prepare).not.toHaveBeenCalled()
 +    expect(ctx.spawnOptions.command).toBe('claude --dangerously-skip-permissions')
 +  })
@@ -1409,7 +1414,7 @@ index 0000000000..8c0d878ed7
 +  it('propagates preflight failures so the launch never runs unsandboxed', async () => {
 +    const ctx = makeCtx()
 +    await expect(
-+      applyAgentSandboxToRuntimePtySpawn(ctx, {
++      applyAgentSandboxToPtySpawn(ctx, {
 +        prepare: async () => {
 +          throw new Error('Agent sandbox is enabled but bubblewrap (bwrap) is not installed.')
 +        },
@@ -1420,19 +1425,31 @@ index 0000000000..8c0d878ed7
 +    expect(ctx.spawnOptions.command).toBe('claude --dangerously-skip-permissions')
 +  })
 +})
-diff --git a/src/main/ipc/pty/runtime/spawn-agent-sandbox.ts b/src/main/ipc/pty/runtime/spawn-agent-sandbox.ts
+diff --git a/src/main/ipc/pty/agent-sandbox-spawn-step.ts b/src/main/ipc/pty/agent-sandbox-spawn-step.ts
 new file mode 100644
-index 0000000000..08e4e187ab
+index 0000000000..e34b101677
 --- /dev/null
-+++ b/src/main/ipc/pty/runtime/spawn-agent-sandbox.ts
-@@ -0,0 +1,78 @@
++++ b/src/main/ipc/pty/agent-sandbox-spawn-step.ts
+@@ -0,0 +1,90 @@
 +import { homedir } from 'node:os'
 +import { join } from 'node:path'
-+import { getAppEnvironment } from '../../../../shared/app-environment'
-+import type { GlobalSettings } from '../../../../shared/global-settings-types'
-+import { isTuiAgent } from '../../../../shared/tui-agent-config'
-+import { prepareAgentSandboxStartupCommand } from '../../../agent-sandbox/agent-sandbox-launch'
-+import type { RuntimePtySpawnState } from './spawn-state'
++import { getAppEnvironment } from '../../../shared/app-environment'
++import type { GlobalSettings } from '../../../shared/global-settings-types'
++import { isTuiAgent } from '../../../shared/tui-agent-config'
++import { prepareAgentSandboxStartupCommand } from '../../agent-sandbox/agent-sandbox-launch'
++
++/**
++ * The slice of spawn state the sandbox step reads. Both PTY pipelines (the renderer's IPC
++ * handler and the runtime controller used by `orca serve`, mobile and the CLI) satisfy it.
++ */
++export type AgentSandboxSpawnContext = {
++  deps: { getSettings?: () => Pick<GlobalSettings, 'linuxAgentSandboxEnabled'> | undefined }
++  args: { connectionId?: string | null; launchAgent?: unknown }
++  cwd: string | undefined
++  env: Record<string, string> | undefined
++  expectedWslDistro: string | null
++  spawnOptions: { command?: string }
++}
 +
 +export type AgentSandboxSpawnGate = {
 +  platform: NodeJS.Platform
@@ -1460,11 +1477,11 @@ index 0000000000..08e4e187ab
 +}
 +
 +/**
-+ * Rewrites the PTY startup command to run inside bubblewrap. `ctx.launchCommand` stays the plain
-+ * agent command so spawn records and Claude-launch detection keep seeing the agent, not bwrap.
++ * Rewrites the PTY startup command to run inside bubblewrap. The pipeline's `launchCommand` stays
++ * the plain agent command so spawn records and Claude-launch detection keep seeing the agent.
 + */
-+export async function applyAgentSandboxToRuntimePtySpawn(
-+  ctx: RuntimePtySpawnState,
++export async function applyAgentSandboxToPtySpawn(
++  ctx: AgentSandboxSpawnContext,
 +  deps: {
 +    prepare?: typeof prepareAgentSandboxStartupCommand
 +    platform?: NodeJS.Platform
@@ -1504,15 +1521,35 @@ index 0000000000..08e4e187ab
 +function defaultStagingParent(): string {
 +  return join(getAppEnvironment().getPath('temp'), 'orca-agent-sandbox')
 +}
+diff --git a/src/main/ipc/pty/ipc/spawn-run.ts b/src/main/ipc/pty/ipc/spawn-run.ts
+index 82e2d33f38..e10e4ab27e 100644
+--- a/src/main/ipc/pty/ipc/spawn-run.ts
++++ b/src/main/ipc/pty/ipc/spawn-run.ts
+@@ -1,3 +1,4 @@
++import { applyAgentSandboxToPtySpawn } from '../agent-sandbox-spawn-step'
+ import { rejectPaneSpawnReservation } from '../pane/spawn-reservation'
+ import { ptySizes } from '../delivery/visibility-state'
+ import { beginPtyIpcSpawn } from './spawn-begin'
+@@ -52,6 +53,10 @@ export async function runPtyIpcSpawn(deps: PtySpawnIpcDeps, args: PtySpawnIpcArg
+       releaseAbandonedAgentTeamsLeader(ctx)
+       return earlyReserved
+     }
++    await applyAgentSandboxToPtySpawn(ctx).catch((error: unknown) => {
++      restoreProvisionalPtySize(ctx)
++      throw error
++    })
+     await executePtyIpcSpawn(ctx)
+     return await commitPtyIpcSpawn(ctx)
+   } catch (err) {
 diff --git a/src/main/ipc/pty/runtime/spawn.ts b/src/main/ipc/pty/runtime/spawn.ts
-index 2af050cd79..c356bf5023 100644
+index 2af050cd79..a7a3907175 100644
 --- a/src/main/ipc/pty/runtime/spawn.ts
 +++ b/src/main/ipc/pty/runtime/spawn.ts
 @@ -13,6 +13,7 @@ import type { PtyRuntimeControllerDeps } from './controller-deps'
  import { adoptMaterializedRuntimePtySpawn } from './spawn-early'
  import { prepareRuntimePtySpawn } from './spawn-preflight'
  import { buildRuntimePtySpawnOptions } from './spawn-options'
-+import { applyAgentSandboxToRuntimePtySpawn } from './spawn-agent-sandbox'
++import { applyAgentSandboxToPtySpawn } from '../agent-sandbox-spawn-step'
  import { executeRuntimePtySpawn } from './spawn-execute'
  import { commitRuntimePtySpawn } from './spawn-commit'
  import { createRuntimePtySpawnState, type RuntimePtySpawnArgs } from './spawn-state'
@@ -1520,7 +1557,7 @@ index 2af050cd79..c356bf5023 100644
      if (earlyReserved) {
        return toRuntimeSpawnReply(earlyReserved)
      }
-+    await applyAgentSandboxToRuntimePtySpawn(ctx).catch((error: unknown) => {
++    await applyAgentSandboxToPtySpawn(ctx).catch((error: unknown) => {
 +      restoreProvisionalPtySize(ctx)
 +      throw error
 +    })
