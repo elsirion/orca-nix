@@ -1,7 +1,7 @@
 {
-  "version": "1.4.204",
-  "sourceHash": "sha256-j3XeyvsYNaD5njOu7uUXCz+u39iPhmEl7nOzu1wonCo=",
-  "pnpmDepsHash": "sha256-U+Jn8dMBnj2cSBgJDkAiXbimyMNOAb25YKv2ufPPTYw=",
+  "version": "1.4.205",
+  "sourceHash": "sha256-cDfUaFPs9qB+rDI4X4Kni5yU96Nfcy+TkA4/HDy5LGo=",
+  "pnpmDepsHash": "sha256-JpX1EdxaOpch/xYMDTSBAPow3sOFUCZSWpLIVVWZBMM=",
   "patches": [
     "linux-agent-bubblewrap-sandbox.patch",
     "direnv-allow-on-worktree-create.patch"
