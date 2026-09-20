@@ -70,7 +70,8 @@ upstream tag pinned in `nix/release.json` with the patches listed in
 [`nix/source-overlay.json`](nix/source-overlay.json) applied, both proposed upstream
 from [elsirion/orca](https://github.com/elsirion/orca): the
 [Linux bubblewrap agent sandbox](nix/patches/linux-agent-bubblewrap-sandbox.patch)
-and [`direnv allow` for freshly created worktrees](nix/patches/direnv-allow-on-worktree-create.patch). Only
+[`direnv allow` for freshly created worktrees](nix/patches/direnv-allow-on-worktree-create.patch),
+and the [attention tint for worktree cards](nix/patches/sidebar-attention-tint.patch). Only
 `out/` inside `app.asar` is replaced; Electron and every native module still come
 from the release AppImage, so the ABI contract above is unchanged.
 

@@ -1,4 +1,4 @@
-From 2ca89289140d04fd15764a3fc9627e70d33ebe73 Mon Sep 17 00:00:00 2001
+From 02eaf35aad281caeef03ef31d389721b7988a474 Mon Sep 17 00:00:00 2001
 From: elsirion <elsirion@protonmail.com>
 Date: Wed, 16 Sep 2026 14:08:51 +0200
 Subject: [PATCH] feat(worktrees): allow a new worktree's .envrc with direnv
