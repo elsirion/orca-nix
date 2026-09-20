@@ -1,0 +1,225 @@
+From a553a821ae8c06d625885f98396637a91298ea58 Mon Sep 17 00:00:00 2001
+From: elsirion <elsirion@protonmail.com>
+Date: Wed, 16 Sep 2026 14:08:26 +0200
+Subject: [PATCH] feat(sidebar): tint the whole worktree card when it needs
+ attention
+
+The status lane's bell and question glyphs are 13px, so a workspace
+waiting on the user is easy to miss in a long sidebar. Layer a whole-card
+wash over the surface instead: the shared --agent-question tone while an
+agent is asking for permission, and the tab strip's amber wash while a
+prior turn is unread. A live working turn suppresses the stale unread
+tint, mirroring the status-lane rule, and rename mode keeps its flat
+input-like surface.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../sidebar/WorktreeCard.lineage.test.tsx     |  6 +++
+ .../WorktreeCard.quick-actions.test.tsx       | 37 ++++++++++++++++++-
+ .../sidebar/worktree-card-attention.test.ts   | 26 +++++++++++++
+ .../sidebar/worktree-card-attention.ts        | 36 ++++++++++++++++++
+ .../sidebar/worktree-card-surface.tsx         | 16 ++++++++
+ 5 files changed, 120 insertions(+), 1 deletion(-)
+ create mode 100644 src/renderer/src/components/sidebar/worktree-card-attention.test.ts
+ create mode 100644 src/renderer/src/components/sidebar/worktree-card-attention.ts
+
+diff --git a/src/renderer/src/components/sidebar/WorktreeCard.lineage.test.tsx b/src/renderer/src/components/sidebar/WorktreeCard.lineage.test.tsx
+index 1e26254e71..5302c86073 100644
+--- a/src/renderer/src/components/sidebar/WorktreeCard.lineage.test.tsx
++++ b/src/renderer/src/components/sidebar/WorktreeCard.lineage.test.tsx
+@@ -36,6 +36,12 @@ vi.mock('@/store', () => ({
+     })
+ }))
+ 
++// Why: the card surface now reads activity status for its attention tint; this
++// store mock carries no terminal state, so pin the status instead.
++vi.mock('./use-worktree-activity-status', () => ({
++  useWorktreeActivityStatus: () => 'inactive'
++}))
++
+ vi.mock('@/lib/worktree-activation', () => ({
+   activateAndRevealWorktree: vi.fn()
+ }))
+diff --git a/src/renderer/src/components/sidebar/WorktreeCard.quick-actions.test.tsx b/src/renderer/src/components/sidebar/WorktreeCard.quick-actions.test.tsx
+index ffef859d9c..fae36f4854 100644
+--- a/src/renderer/src/components/sidebar/WorktreeCard.quick-actions.test.tsx
++++ b/src/renderer/src/components/sidebar/WorktreeCard.quick-actions.test.tsx
+@@ -57,8 +57,10 @@ vi.mock('@/components/ui/tooltip', () => ({
+   TooltipTrigger: ({ children }: { children: ReactNode }) => <>{children}</>
+ }))
+ 
++const activityStatusMocks = vi.hoisted(() => ({ status: 'idle' }))
++
+ vi.mock('./use-worktree-activity-status', () => ({
+-  useWorktreeActivityStatus: () => 'idle'
++  useWorktreeActivityStatus: () => activityStatusMocks.status
+ }))
+ 
+ vi.mock('./CacheTimer', () => ({
+@@ -142,6 +144,39 @@ describe('WorktreeCard quick actions', () => {
+     projectGroups = []
+     workspaceDeleteModifierPressed = false
+     gitConflictOperationByWorktree = {}
++    activityStatusMocks.status = 'idle'
++  })
++
++  it('tints the whole card amber while the workspace is unread', () => {
++    const markup = renderToStaticMarkup(
++      <WorktreeCard worktree={makeWorktree()} repo={makeRepo()} isActive={false} />
++    )
++
++    expect(markup).toContain('data-worktree-card-attention="unread"')
++    expect(markup).toContain('bg-amber-500/10')
++  })
++
++  it('tints the whole card with the agent-question tone when permission is needed', () => {
++    activityStatusMocks.status = 'permission'
++    const markup = renderToStaticMarkup(
++      <WorktreeCard worktree={makeWorktree({ isUnread: false })} repo={makeRepo()} isActive />
++    )
++
++    expect(markup).toContain('data-worktree-card-attention="question"')
++    expect(markup).toContain('ring-agent-question/30')
++    expect(markup).toContain('data-worktree-card-active="primary"')
++  })
++
++  it('leaves a read, quiet card untinted', () => {
++    const markup = renderToStaticMarkup(
++      <WorktreeCard
++        worktree={makeWorktree({ isUnread: false })}
++        repo={makeRepo()}
++        isActive={false}
++      />
++    )
++
++    expect(markup).not.toContain('data-worktree-card-attention=')
+   })
+ 
+   it('marks the unread toggle as a workspace-board-preserving action', () => {
+diff --git a/src/renderer/src/components/sidebar/worktree-card-attention.test.ts b/src/renderer/src/components/sidebar/worktree-card-attention.test.ts
+new file mode 100644
+index 0000000000..4896d18a5b
+--- /dev/null
++++ b/src/renderer/src/components/sidebar/worktree-card-attention.test.ts
+@@ -0,0 +1,26 @@
++import { describe, expect, it } from 'vitest'
++import { resolveWorktreeCardAttentionTone } from './worktree-card-attention'
++
++describe('resolveWorktreeCardAttentionTone', () => {
++  it('tints the card for a live permission request regardless of unread', () => {
++    expect(resolveWorktreeCardAttentionTone('permission', false)).toBe('question')
++    expect(resolveWorktreeCardAttentionTone('permission', true)).toBe('question')
++  })
++
++  it('tints unread cards once no live turn owns the status', () => {
++    expect(resolveWorktreeCardAttentionTone('done', true)).toBe('unread')
++    expect(resolveWorktreeCardAttentionTone('active', true)).toBe('unread')
++    expect(resolveWorktreeCardAttentionTone('inactive', true)).toBe('unread')
++    expect(resolveWorktreeCardAttentionTone('interrupted', true)).toBe('unread')
++  })
++
++  it('lets a live working turn suppress the stale unread tint', () => {
++    expect(resolveWorktreeCardAttentionTone('working', true)).toBeNull()
++  })
++
++  it('leaves quiet, read cards untinted', () => {
++    expect(resolveWorktreeCardAttentionTone('active', false)).toBeNull()
++    expect(resolveWorktreeCardAttentionTone('working', false)).toBeNull()
++    expect(resolveWorktreeCardAttentionTone('done', false)).toBeNull()
++  })
++})
+diff --git a/src/renderer/src/components/sidebar/worktree-card-attention.ts b/src/renderer/src/components/sidebar/worktree-card-attention.ts
+new file mode 100644
+index 0000000000..c78ae98f83
+--- /dev/null
++++ b/src/renderer/src/components/sidebar/worktree-card-attention.ts
+@@ -0,0 +1,36 @@
++import type { WorktreeStatus } from '@/lib/worktree-status'
++
++export type WorktreeCardAttentionTone = 'question' | 'unread'
++
++/**
++ * Which whole-card tint a worktree card earns. `question` is the live "agent is
++ * asking you something" state; `unread` is a prior-turn completion/bell the user
++ * has not looked at yet. Mirrors the status-lane rule: a live working/permission
++ * state is newer than the unread flag, so it owns the card until the turn ends.
++ */
++export function resolveWorktreeCardAttentionTone(
++  status: WorktreeStatus,
++  isUnread: boolean
++): WorktreeCardAttentionTone | null {
++  if (status === 'permission') {
++    return 'question'
++  }
++  if (isUnread && status !== 'working') {
++    return 'unread'
++  }
++  return null
++}
++
++// Why: same hues as the glyphs they enlarge — the tab strip's amber wash for
++// unread, the shared --agent-question token for permission — so the card and its
++// status icon never disagree. A child overlay (not a card background) layers
++// cleanly over the active/selected data-attribute styles.
++const ATTENTION_OVERLAY_BASE_CLASS_NAME = 'pointer-events-none absolute inset-0 rounded-lg'
++
++export const WORKTREE_CARD_ATTENTION_OVERLAY_CLASS_NAMES: Record<
++  WorktreeCardAttentionTone,
++  string
++> = {
++  question: `${ATTENTION_OVERLAY_BASE_CLASS_NAME} bg-agent-question/[0.08] ring-1 ring-inset ring-agent-question/30`,
++  unread: `${ATTENTION_OVERLAY_BASE_CLASS_NAME} bg-amber-500/10`
++}
+diff --git a/src/renderer/src/components/sidebar/worktree-card-surface.tsx b/src/renderer/src/components/sidebar/worktree-card-surface.tsx
+index baf6805699..257e277bfd 100644
+--- a/src/renderer/src/components/sidebar/worktree-card-surface.tsx
++++ b/src/renderer/src/components/sidebar/worktree-card-surface.tsx
+@@ -4,8 +4,13 @@ import { LoaderCircle } from 'lucide-react'
+ import { cn } from '@/lib/utils'
+ import { AutoRenameFailedDialog } from './AutoRenameFailedDialog'
+ import WorktreeContextMenu from './WorktreeContextMenu'
++import {
++  resolveWorktreeCardAttentionTone,
++  WORKTREE_CARD_ATTENTION_OVERLAY_CLASS_NAMES
++} from './worktree-card-attention'
+ import { WorktreeCardParentContent } from './worktree-card-parent-content'
+ import { buildWorktreeCardPresentation } from './worktree-card-presentation'
++import { useWorktreeActivityStatus } from './use-worktree-activity-status'
+ import type { WorktreeCardController } from './use-worktree-card-controller'
+ 
+ export function WorktreeCardSurface({ card }: { card: WorktreeCardController }): React.JSX.Element {
+@@ -40,6 +45,13 @@ export function WorktreeCardSurface({ card }: { card: WorktreeCardController }):
+     setShowRenameErrorDialog
+   } = card
+   const { titleOnlyCard, cardStyle } = presentation
++  const activityStatus = useWorktreeActivityStatus(worktree.id)
++  // Why: the status glyph is too small to catch the eye across a long list; tint
++  // the whole card so "needs you" reads at a glance. Rename mode flattens the
++  // surface to look like an input, so the tint steps aside there.
++  const attentionTone = titleRenaming
++    ? null
++    : resolveWorktreeCardAttentionTone(activityStatus, worktree.isUnread)
+ 
+   const parentCardContent = <WorktreeCardParentContent card={card} presentation={presentation} />
+ 
+@@ -76,6 +88,7 @@ export function WorktreeCardSurface({ card }: { card: WorktreeCardController }):
+         isActiveSurface && !isLineageDropTarget ? activeSurfaceVariant : undefined
+       }
+       data-worktree-lineage-drop-target={isLineageDropTarget || undefined}
++      data-worktree-card-attention={attentionTone ?? undefined}
+       onClick={handleClick}
+       onDoubleClick={affiliateListMode ? undefined : handleDoubleClick}
+       draggable={!affiliateListMode && nativeDragEnabled && !isDeleting && !titleRenaming}
+@@ -84,6 +97,9 @@ export function WorktreeCardSurface({ card }: { card: WorktreeCardController }):
+       aria-busy={isDeleting}
+       style={cardStyle}
+     >
++      {attentionTone && (
++        <span aria-hidden className={WORKTREE_CARD_ATTENTION_OVERLAY_CLASS_NAMES[attentionTone]} />
++      )}
+       {isDeleting && (
+         <div className="absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-background/50 backdrop-blur-[1px]">
+           <div className="inline-flex items-center gap-1.5 rounded-full bg-background px-3 py-1 text-[11px] font-medium text-foreground shadow-sm border border-border/50">
+-- 
+2.55.0
+

@@ -1,4 +1,4 @@
-From ccabba5a9434778dcff67f5c6a897643ab05e9c7 Mon Sep 17 00:00:00 2001
+From 22c7680c5062ff9356ab7652b8b79a154021fe71 Mon Sep 17 00:00:00 2001
 From: elsirion <elsirion@protonmail.com>
 Date: Tue, 15 Sep 2026 20:33:10 +0200
 Subject: [PATCH] feat(agents): opt-in bubblewrap sandbox for local Linux agent
@@ -1741,7 +1741,7 @@ index ed353d5acb..e10060e083 100644
      title: getAgentGeneratedTabTitlesTitle(),
      description: getAgentGeneratedTabTitlesDescription(),
 diff --git a/src/renderer/src/i18n/en-runtime-required.json b/src/renderer/src/i18n/en-runtime-required.json
-index 8707f0d0ad..4a9167f603 100644
+index 8fb5d19446..03e165f3da 100644
 --- a/src/renderer/src/i18n/en-runtime-required.json
 +++ b/src/renderer/src/i18n/en-runtime-required.json
 @@ -1540,6 +1540,16 @@
@@ -1762,10 +1762,10 @@ index 8707f0d0ad..4a9167f603 100644
            "7707c15abb": "Agent status hooks",
            "a68a642835": "Shows working, waiting, and done states in Orca. Turn off to remove Orca-managed hooks and stop reinstalling them."
 diff --git a/src/renderer/src/i18n/locales/en.json b/src/renderer/src/i18n/locales/en.json
-index aecae8bc23..7854f66e65 100644
+index 2a0fe5755d..56bde00794 100644
 --- a/src/renderer/src/i18n/locales/en.json
 +++ b/src/renderer/src/i18n/locales/en.json
-@@ -10621,6 +10621,16 @@
+@@ -10635,6 +10635,16 @@
            "7707c15abb": "Agent status hooks",
            "a68a642835": "Shows working, waiting, and done states in Orca. Turn off to remove Orca-managed hooks and stop reinstalling them."
          },

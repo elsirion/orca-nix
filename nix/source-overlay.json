@@ -4,6 +4,7 @@
   "pnpmDepsHash": "sha256-JpX1EdxaOpch/xYMDTSBAPow3sOFUCZSWpLIVVWZBMM=",
   "patches": [
     "linux-agent-bubblewrap-sandbox.patch",
-    "direnv-allow-on-worktree-create.patch"
+    "direnv-allow-on-worktree-create.patch",
+    "sidebar-attention-tint.patch"
   ]
 }
